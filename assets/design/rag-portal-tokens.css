@@ -1,0 +1,175 @@
+/*
+ * RAG Portal visual foundation
+ *
+ * Framework-neutral design tokens. Import this once from the frontend global
+ * stylesheet, then map these values into the styled-components theme. Keep
+ * state meaning semantic (for example --rp-status-danger), never tied to a
+ * component-specific colour name.
+ */
+
+:root {
+  /* Brand and neutrals: quiet, document-first, NotebookLM-inspired density. */
+  --rp-canvas: #f8f8f6;
+  --rp-surface: #ffffff;
+  --rp-surface-subtle: #f2f4f7;
+  --rp-surface-hover: #eaedf2;
+  --rp-surface-selected: #edf3ff;
+  --rp-surface-elevated: #ffffff;
+  --rp-surface-info: #eef4ff;
+  --rp-surface-success: #ecfdf3;
+  --rp-surface-warning: #fff7e8;
+  --rp-surface-danger: #fef3f2;
+  --rp-ink: #1d2433;
+  --rp-ink-subtle: #4b5565;
+  --rp-ink-muted: #697586;
+  --rp-ink-disabled: #98a2b3;
+  --rp-border: #d9dee7;
+  --rp-border-strong: #b8c1d0;
+  --rp-border-focus: #2e62d6;
+
+  --rp-action: #2e62d6;
+  --rp-action-hover: #244fae;
+  --rp-action-active: #1d428f;
+  --rp-action-on: #ffffff;
+  --rp-accent: #7c4dbe;
+
+  /* Status pairs meet contrast requirements when used as text on white. */
+  --rp-status-success: #087443;
+  --rp-status-warning: #9a5800;
+  --rp-status-danger: #b42318;
+  --rp-status-progress: #2e62d6;
+  --rp-status-neutral: #596579;
+
+  --rp-font-sans: "Pretendard", "Apple SD Gothic Neo", "Noto Sans KR",
+    system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --rp-font-mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+
+  --rp-font-size-12: 0.75rem;
+  --rp-font-size-13: 0.8125rem;
+  --rp-font-size-14: 0.875rem;
+  --rp-font-size-16: 1rem;
+  --rp-font-size-18: 1.125rem;
+  --rp-font-size-20: 1.25rem;
+  --rp-font-size-24: 1.5rem;
+  --rp-font-size-30: 1.875rem;
+  --rp-line-tight: 1.3;
+  --rp-line-normal: 1.55;
+  --rp-weight-regular: 400;
+  --rp-weight-medium: 500;
+  --rp-weight-semibold: 600;
+  --rp-weight-bold: 700;
+
+  --rp-space-1: 0.25rem;
+  --rp-space-2: 0.5rem;
+  --rp-space-3: 0.75rem;
+  --rp-space-4: 1rem;
+  --rp-space-5: 1.25rem;
+  --rp-space-6: 1.5rem;
+  --rp-space-8: 2rem;
+  --rp-space-10: 2.5rem;
+  --rp-space-12: 3rem;
+  --rp-space-16: 4rem;
+
+  --rp-radius-sm: 0.375rem;
+  --rp-radius-md: 0.625rem;
+  --rp-radius-lg: 0.875rem;
+  --rp-radius-xl: 1.25rem;
+  --rp-shadow-card: 0 1px 2px rgb(16 24 40 / 0.04),
+    0 1px 3px rgb(16 24 40 / 0.06);
+  --rp-shadow-raised: 0 8px 24px rgb(16 24 40 / 0.12);
+  --rp-shadow-dialog: 0 20px 56px rgb(16 24 40 / 0.18),
+    0 4px 12px rgb(16 24 40 / 0.08);
+  --rp-focus-ring: 0 0 0 3px rgb(46 98 214 / 0.28);
+  --rp-transition-fast: 120ms ease-out;
+  --rp-transition-normal: 180ms ease-out;
+
+  --rp-page-max: 90rem;
+  --rp-detail-sidebar: 18rem;
+  --rp-touch-target: 2.75rem;
+
+  /* Workspace geometry. These describe roles, not page-specific pixels. */
+  --rp-global-header-height: 3.5rem;
+  --rp-panel-header-height: 3.5rem;
+  --rp-app-padding: 1rem;
+  --rp-panel-gap: 1rem;
+  --rp-global-nav-wide: 14.5rem;
+  --rp-global-nav-rail: 4rem;
+  --rp-context-panel-min: 15rem;
+  --rp-context-panel-default: 18rem;
+  --rp-context-panel-max: 26.25rem;
+  --rp-output-panel-min: 17.5rem;
+  --rp-output-panel-default: 21.5rem;
+  --rp-output-panel-max: 30rem;
+  --rp-core-work-min: 32.5rem;
+  --rp-reading-width: 45rem;
+  --rp-composer-max-height: 15rem;
+  --rp-rail-width: 4rem;
+
+  --rp-z-base: 0;
+  --rp-z-sticky: 10;
+  --rp-z-popover: 100;
+  --rp-z-drawer: 200;
+  --rp-z-dialog: 300;
+  --rp-z-toast: 400;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --rp-transition-fast: 0ms;
+    --rp-transition-normal: 0ms;
+  }
+}
+
+/* Reference primitives: adapters may duplicate these rules in styled-components. */
+.rp-focusable:focus-visible {
+  outline: 0;
+  box-shadow: var(--rp-focus-ring);
+}
+
+.rp-card {
+  background: var(--rp-surface);
+  border: 1px solid var(--rp-border);
+  border-radius: var(--rp-radius-lg);
+  box-shadow: var(--rp-shadow-card);
+}
+
+.rp-status {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--rp-space-1);
+  min-height: 1.5rem;
+  padding: 0 var(--rp-space-2);
+  border-radius: 999px;
+  font-size: var(--rp-font-size-12);
+  font-weight: var(--rp-weight-semibold);
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.rp-status--success { background: var(--rp-surface-success); color: var(--rp-status-success); }
+.rp-status--warning { background: var(--rp-surface-warning); color: var(--rp-status-warning); }
+.rp-status--danger { background: var(--rp-surface-danger); color: var(--rp-status-danger); }
+.rp-status--progress { background: var(--rp-surface-info); color: var(--rp-status-progress); }
+.rp-status--neutral { background: var(--rp-surface-subtle); color: var(--rp-status-neutral); }
+
+/* Use only for an inline evidence-reference button, never for a generic tag. */
+.rp-citation-chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.25rem;
+  min-height: 1.25rem;
+  margin-inline: 0.125rem;
+  padding: 0 0.3125rem;
+  border: 1px solid #b7cdf9;
+  border-radius: 999px;
+  background: var(--rp-surface-info);
+  color: var(--rp-action-active);
+  font-size: var(--rp-font-size-12);
+  font-weight: var(--rp-weight-semibold);
+  text-decoration: none;
+  vertical-align: baseline;
+}
+
+.rp-citation-chip:hover { background: #dce9ff; }
+.rp-citation-chip:focus-visible { outline: 0; box-shadow: var(--rp-focus-ring); }

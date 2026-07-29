@@ -1,0 +1,15 @@
+{
+  "fileCount": 38,
+  "markdownCount": 34,
+  "typescriptExampleCount": 3,
+  "totalLines": 3434,
+  "emptyFiles": [],
+  "requiredFiles": {
+    "SKILL.md": true,
+    "README.md": true,
+    "design-tokens.md": true,
+    "components.md": true,
+    "accessibility.md": true,
+    "review-checklist.md": true
+  }
+}

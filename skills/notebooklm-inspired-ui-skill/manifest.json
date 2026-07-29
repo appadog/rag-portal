@@ -1,0 +1,21 @@
+{
+  "name": "notebooklm-inspired-ui",
+  "version": "2.0.0",
+  "language": "ko-KR",
+  "entry": "SKILL.md",
+  "category": [
+    "frontend",
+    "design-system",
+    "ai-ux",
+    "workspace"
+  ],
+  "recommendedStack": {
+    "framework": "React",
+    "language": "TypeScript",
+    "buildTool": "Vite",
+    "styling": "styled-components",
+    "stateManagement": "Zustand",
+    "serverState": "TanStack Query",
+    "icons": "lucide-react"
+  }
+}

@@ -1,0 +1,120 @@
+# Local Python environments and test/cache output
+apps/backend/.venv/
+apps/backend/.pytest_cache/
+apps/backend/**/__pycache__/
+*.py[cod]
+.DS_Store
+
+# Frontend dependencies and build output
+apps/frontend/node_modules/
+apps/frontend/dist/
+
+# Local runtime configuration
+.env
+.env.*
+*.sqlite3
+
+
+# OS files
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+
+# Editor / IDE
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.example.json
+*.swp
+*.swo
+
+# Logs
+*.log
+logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+!*.env.example
+apps/**/.env
+apps/**/.env.*
+!apps/**/.env.example
+infra/**/.env
+infra/**/.env.*
+!infra/**/.env.example
+
+# Node / frontend
+node_modules/
+apps/**/node_modules/
+.npm/
+.pnpm-store/
+.yarn/
+apps/frontend/dist/
+apps/frontend/build/
+apps/frontend/coverage/
+apps/frontend/.vite/
+apps/frontend/.turbo/
+apps/frontend/storybook-static/
+apps/frontend/playwright-report/
+apps/frontend/test-results/
+
+# Python / backend
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+ENV/
+apps/backend/.venv/
+apps/backend/venv/
+apps/backend/.pytest_cache/
+apps/backend/.ruff_cache/
+apps/backend/.mypy_cache/
+apps/backend/.coverage
+apps/backend/htmlcov/
+apps/backend/dist/
+apps/backend/build/
+apps/backend/*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Backend local runtime files
+apps/backend/.local/
+apps/backend/uploads/
+apps/backend/storage/
+apps/backend/tmp/
+apps/backend/celerybeat-schedule*
+
+# Local infrastructure runtime data
+infra/local/data/
+infra/local/volumes/
+infra/local/.data/
+infra/local/.runtime/
+infra/local/postgres/
+infra/local/redis/
+infra/local/minio/
+infra/local/neo4j/
+
+# Docker Compose local overrides
+docker-compose.override.yml
+infra/local/docker-compose.override.yml
+
+# Generated reports and local artifacts
+coverage/
+reports/
+tmp/
+temp/
+.cache/
+
+# External/reference workspaces copied locally
+skillset/

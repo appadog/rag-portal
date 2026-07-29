@@ -1,0 +1,41 @@
+# Package Inventory
+
+| File | Lines |
+|---|---:|
+| `01-analysis/information-architecture.md` | 141 |
+| `01-analysis/interaction-model.md` | 79 |
+| `01-analysis/responsive-behavior.md` | 77 |
+| `01-analysis/ui-analysis.md` | 194 |
+| `02-foundations/design-principles.md` | 62 |
+| `02-foundations/design-tokens.md` | 267 |
+| `02-foundations/visual-language.md` | 67 |
+| `03-patterns/composer.md` | 81 |
+| `03-patterns/context-panel.md` | 81 |
+| `03-patterns/core-workspace.md` | 73 |
+| `03-patterns/empty-loading-error.md` | 74 |
+| `03-patterns/evidence-and-citations.md` | 69 |
+| `03-patterns/interaction-patterns.md` | 64 |
+| `03-patterns/output-studio.md` | 71 |
+| `03-patterns/workspace-shell.md` | 104 |
+| `04-components/component-api.md` | 140 |
+| `04-components/components.md` | 205 |
+| `04-components/state-matrix.md` | 70 |
+| `05-implementation/accessibility.md` | 97 |
+| `05-implementation/performance.md` | 51 |
+| `05-implementation/react-architecture.md` | 119 |
+| `05-implementation/styled-components.md` | 154 |
+| `05-implementation/testing.md` | 75 |
+| `05-implementation/zustand-state.md` | 78 |
+| `06-adaptation/anti-copying.md` | 38 |
+| `06-adaptation/decision-trees.md` | 64 |
+| `06-adaptation/product-mapping.md` | 82 |
+| `06-adaptation/review-checklist.md` | 71 |
+| `CHANGELOG.md` | 11 |
+| `README.md` | 60 |
+| `SKILL.md` | 192 |
+| `examples/WorkspaceShell.tsx` | 91 |
+| `examples/theme.ts` | 45 |
+| `examples/useWorkspaceUIStore.ts` | 67 |
+| `examples/workspace-wireframe.md` | 68 |
+| `manifest.json` | 21 |
+| `references/reference-sources.md` | 90 |
