@@ -3,6 +3,7 @@ import userEvent from '@testing-library/user-event';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { afterEach, beforeEach, vi } from 'vitest';
 import { ragApi } from '../../shared/api/client';
+import { mockInstances } from '../../shared/mocks/ragFixtures';
 import { RagDetailPage } from './RagDetailWorkspace';
 
 function renderWorkspace() {
@@ -132,5 +133,105 @@ describe('RagDetailPage workspace', () => {
       'aria-labelledby',
       'rag-travel-output-tab-documents',
     );
+  });
+
+  it('shows full-document reindex progress without disabling current search', async () => {
+    vi.spyOn(ragApi, 'get').mockResolvedValue({
+      ...mockInstances[0],
+      fullReindexJob: {
+        id: 'full-reindex-1',
+        state: 'INDEXING',
+        currentStep: '전체 문서 조각을 색인하고 있어요',
+        completed: 3,
+        total: 8,
+        canRetry: false,
+        canCancel: false,
+        stages: [],
+      },
+    });
+    renderWorkspace();
+
+    expect(
+      await screen.findByText(
+        /전체 문서 색인 중: 전체 문서 조각을 색인하고 있어요 · 3\/8 단계 완료/,
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByRole('textbox', { name: '검색 질문' })).not.toBeDisabled();
+  });
+
+  it('shows grounded generation progress and a calm fallback disclosure from stream metadata', async () => {
+    const user = userEvent.setup();
+    let resolveAnswer:
+      | ((answer: Awaited<ReturnType<typeof ragApi.streamAnswer>>) => void)
+      | undefined;
+    vi.spyOn(ragApi, 'streamAnswer').mockImplementation(
+      (_id, _question, _documentIds, _sensitivity, options) => {
+        options?.onUpdate?.({
+          text: '',
+          citations: [],
+          generation: { status: 'GENERATING', fallback: false },
+        });
+        return new Promise((resolve) => {
+          resolveAnswer = resolve;
+        });
+      },
+    );
+    renderWorkspace();
+    const question = await screen.findByRole('textbox', { name: '검색 질문' });
+    await user.type(question, '국내 출장 숙박비는 얼마까지 되나요?');
+    await user.click(screen.getByRole('button', { name: '질문하기' }));
+
+    await waitFor(() =>
+      expect(
+        screen.getAllByText(/문서 근거를 바탕으로 답을 정리하고 있어요/).length,
+      ).toBeGreaterThan(0),
+    );
+    resolveAnswer?.({
+      text: '근거 기반 답변',
+      citations: [],
+      latencyMs: 10,
+      generation: { fallback: true, detail: '생성 모델을 사용할 수 없었어요.' },
+    });
+    expect(
+      await screen.findByText(
+        /문서 근거를 바탕으로 발췌한 결과예요 · 생성 모델을 사용할 수 없었어요/,
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it('discloses multi-document coverage and opens each document source in Evidence', async () => {
+    const user = userEvent.setup();
+    vi.spyOn(ragApi, 'streamAnswer').mockResolvedValue({
+      text: '두 문서의 근거를 함께 정리한 답변',
+      citations: [
+        {
+          id: 'policy-1',
+          title: '출장비_지급_규정.pdf',
+          documentName: '출장비_지급_규정.pdf',
+          excerpt: '숙박비 한도는 1박 10만원입니다.',
+          page: 'p. 3',
+        },
+        {
+          id: 'benefits-1',
+          title: '복리후생_안내.pdf',
+          documentName: '복리후생_안내.pdf',
+          excerpt: '복리후생 지급 기준을 안내합니다.',
+          page: 'p. 2',
+        },
+      ],
+      latencyMs: 10,
+      documentCoverage: [
+        { documentName: '출장비_지급_규정.pdf', citationCount: 1 },
+        { documentName: '복리후생_안내.pdf', citationCount: 1 },
+      ],
+    });
+    renderWorkspace();
+    const question = await screen.findByRole('textbox', { name: '검색 질문' });
+    await user.type(question, '숙박비와 복리후생 기준을 알려줘');
+    await user.click(screen.getByRole('button', { name: '질문하기' }));
+
+    expect(await screen.findByText('2개 문서의 근거를 함께 확인했어요.')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '복리후생_안내.pdf 근거 1개 보기' }));
+    expect(await screen.findByRole('heading', { name: '복리후생_안내.pdf' })).toBeInTheDocument();
   });
 });

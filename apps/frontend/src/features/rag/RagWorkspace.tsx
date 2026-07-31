@@ -125,6 +125,26 @@ const CompareControls = styled.div`
     }
   }
 `;
+const ComparisonScopeNotice = styled.section`
+  display: flex;
+  gap: var(--rp-space-3);
+  align-items: flex-start;
+  margin: 0 0 var(--rp-space-4);
+  padding: var(--rp-space-3);
+  border: 1px solid var(--rp-border);
+  border-radius: var(--rp-radius-sm);
+  background: var(--rp-surface-info);
+  p {
+    margin: var(--rp-space-1) 0 0;
+    color: var(--rp-ink-subtle);
+    font-size: var(--rp-font-size-13);
+    line-height: var(--rp-line-normal);
+  }
+  @media (max-width: 47.9375rem) {
+    flex-direction: column;
+    gap: var(--rp-space-2);
+  }
+`;
 const CandidateSwitcher = styled.div`
   display: none;
   gap: var(--rp-space-2);
@@ -472,21 +492,60 @@ function Candidate({
   selected,
   onSelect,
   onOpen,
+  onRetryPreparation,
+  canRetryPreparation,
 }: {
   candidate: PipelineCandidate;
   selected: boolean;
   onSelect: () => void;
   onOpen: (candidate: PipelineCandidate, trigger: HTMLElement) => void;
+  onRetryPreparation: () => void;
+  canRetryPreparation: boolean;
 }) {
-  const noEvidence = candidate.evidence.length === 0;
+  const state = candidate.comparisonState ?? (candidate.evidence.length ? 'READY' : 'NO_EVIDENCE');
+  const selectable = state === 'READY';
+  const stateCopy = {
+    READY: {
+      label: '비교 가능',
+      detail: '답변과 근거를 확인한 뒤 선택할 수 있어요.',
+      tone: 'brand' as const,
+    },
+    PREPARING: {
+      label: '준비 중',
+      detail:
+        candidate.comparisonStateDetail ??
+        '이 방식을 비교할 답변과 근거를 준비하고 있어요. 준비가 끝나면 선택할 수 있어요.',
+      tone: 'warning' as const,
+    },
+    FAILED: {
+      label: '준비 실패',
+      detail:
+        candidate.comparisonStateDetail ??
+        candidate.preparation?.error ??
+        '후보 준비를 완료하지 못했어요.',
+      tone: 'warning' as const,
+    },
+    NO_EVIDENCE: {
+      label: '근거 없음',
+      detail:
+        candidate.comparisonStateDetail ??
+        '이 질문을 뒷받침할 문서 근거를 찾지 못했어요. 질문이나 문서 범위를 바꿔 다시 비교해 보세요.',
+      tone: 'muted' as const,
+    },
+  }[state];
   return (
-    <CandidateCard $selected={selected}>
+    <CandidateCard
+      $selected={selected}
+      aria-busy={state === 'PREPARING'}
+      aria-label={`${candidate.label}, ${stateCopy.label}, ${selectable ? '선택 가능' : '선택할 수 없음'}, 현재 ${candidate.selectionCount}회 선택`}
+    >
       <div className="candidate-header">
         <input
           type="checkbox"
           checked={selected}
+          disabled={!selectable}
           onChange={onSelect}
-          aria-label={`${candidate.label}, 현재 ${candidate.selectionCount}회 선택`}
+          aria-label={`${candidate.label}, ${stateCopy.label}${selectable ? `, 현재 ${candidate.selectionCount}회 선택` : ', 선택할 수 없음'}`}
         />
         <div>
           <h3>
@@ -503,10 +562,26 @@ function Candidate({
             선택 {candidate.selectionCount}회
             {candidate.chunkCount ? ` · 근거 조각 ${candidate.chunkCount}개` : ''}
           </span>
+          <Pill $tone={stateCopy.tone}>{stateCopy.label}</Pill>
         </div>
       </div>
-      {noEvidence ? (
-        <div className="empty-answer">이 문서 범위에서는 답을 뒷받침할 근거를 찾지 못했어요.</div>
+      {!selectable ? (
+        <div className="empty-answer" role={state === 'FAILED' ? 'alert' : 'status'}>
+          {state === 'PREPARING' ? `준비 중: ${stateCopy.detail}` : stateCopy.detail}
+          {state === 'NO_EVIDENCE' && ' 질문이나 문서 범위를 바꿔 다시 비교해 보세요.'}
+          {state === 'FAILED' && (
+            <div>
+              <Button
+                $variant="secondary"
+                onClick={onRetryPreparation}
+                disabled={!canRetryPreparation}
+              >
+                문서 준비 다시 시도
+              </Button>
+              {!canRetryPreparation && <span> 준비 작업 상태를 확인해 주세요.</span>}
+            </div>
+          )}
+        </div>
       ) : (
         <p className="answer">
           {candidate.answer}
@@ -518,8 +593,14 @@ function Candidate({
           개발용 fallback 검색 · {candidate.runtime.warning ?? candidate.runtime.provider}
         </div>
       )}
+      {candidate.generation && (
+        <span className="meta" role="status">
+          {candidate.generation.fallback ? '문서 근거 발췌 결과' : '문서 근거 기반 답변'}
+          {candidate.generation.provider ? ` · ${candidate.generation.provider}` : ''}
+        </span>
+      )}
       <div className="bottom">
-        {noEvidence ? (
+        {!selectable ? (
           <span>원본 조각 없음</span>
         ) : (
           <button
@@ -558,9 +639,12 @@ function trapSetupDialog(event: ReactKeyboardEvent<HTMLElement>) {
 
 function useMediaQuery(query: string) {
   const [matches, setMatches] = useState(() =>
-    typeof window !== 'undefined' ? window.matchMedia(query).matches : false,
+    typeof window !== 'undefined' && typeof window.matchMedia === 'function'
+      ? window.matchMedia(query).matches
+      : false,
   );
   useEffect(() => {
+    if (typeof window.matchMedia !== 'function') return;
     const media = window.matchMedia(query);
     const update = () => setMatches(media.matches);
     update();
@@ -641,11 +725,30 @@ export function RagSetupPage() {
     setDetail(await ragApi.get(id));
   };
   const toggle = (candidateId: string) =>
-    setSelected((items) =>
-      items.includes(candidateId)
+    setSelected((items) => {
+      const candidate = round?.candidates.find((item) => item.id === candidateId);
+      if (candidate?.comparisonState && candidate.comparisonState !== 'READY') return items;
+      if (!candidate?.comparisonState && !candidate?.evidence.length) return items;
+      return items.includes(candidateId)
         ? items.filter((item) => item !== candidateId)
-        : [...items, candidateId],
-    );
+        : [...items, candidateId];
+    });
+  const selectableCandidateIds = useMemo(
+    () =>
+      new Set(
+        (round?.candidates ?? [])
+          .filter((candidate) =>
+            candidate.comparisonState
+              ? candidate.comparisonState === 'READY'
+              : candidate.evidence.length > 0,
+          )
+          .map((candidate) => candidate.id),
+      ),
+    [round?.candidates],
+  );
+  useEffect(() => {
+    setSelected((items) => items.filter((id) => selectableCandidateIds.has(id)));
+  }, [selectableCandidateIds]);
   const counts = useMemo(
     () =>
       (round?.candidates ?? []).map((candidate) => ({
@@ -667,13 +770,25 @@ export function RagSetupPage() {
     return counts.filter((candidate) => candidate.id === current);
   }, [activeCandidateId, counts, singleCandidateMode]);
   const winner = useMemo(() => {
-    const sorted = [...counts].sort((a, b) => b.selectionCount - a.selectionCount);
-    return sorted[0] &&
+    const sorted = counts
+      .filter((candidate) => selectableCandidateIds.has(candidate.id))
+      .sort((a, b) => b.selectionCount - a.selectionCount);
+    return selected.length > 0 &&
+      sorted[0] &&
       sorted[0].selectionCount > 0 &&
       sorted[0].selectionCount > (sorted[1]?.selectionCount ?? -1)
       ? sorted[0]
       : undefined;
   }, [counts]);
+  const completionDisabledReason = finalizeSubmitting
+    ? '확정 정보를 저장하고 있어요.'
+    : selectableCandidateIds.size === 0
+      ? '아직 비교할 준비가 된 후보가 없어요.'
+      : selected.length === 0
+        ? '답변과 근거를 보고 도움이 된 후보를 하나 이상 골라 주세요.'
+        : !winner
+          ? '아직 한 가지 방식이 앞서지 않았어요. 다음 질문에서도 비교해 주세요.'
+          : undefined;
   const nextRound = async () => {
     if (!round || !detail || compareSubmitting) return;
     setCompareSubmitting(true);
@@ -858,6 +973,31 @@ export function RagSetupPage() {
           대시보드로
         </Button>
       </PageHeader>
+      {detail.documents.some((document) => document.comparisonScope === 'SAMPLE') && (
+        <ComparisonScopeNotice role="status" aria-label="표본 문서 비교 안내">
+          <Pill $tone="warning">표본으로 비교 중</Pill>
+          <div>
+            <strong>
+              {detail.documents
+                .filter((document) => document.comparisonScope === 'SAMPLE')
+                .map((document) => document.name)
+                .join(', ')}
+            </strong>
+            <p>
+              큰 문서는 빠르게 방식을 비교하기 위해 대표 조각{' '}
+              {detail.documents
+                .filter((document) => document.comparisonScope === 'SAMPLE')
+                .map((document) =>
+                  document.comparisonChunkCount && document.estimatedChunkCount
+                    ? `${document.comparisonChunkCount}/${document.estimatedChunkCount}개`
+                    : '일부',
+                )
+                .join(', ')}
+              만 사용했어요. 방식을 확정하면 전체 문서 색인을 이어서 준비합니다.
+            </p>
+          </div>
+        </ComparisonScopeNotice>
+      )}
       <CompareControls>
         <Input
           aria-label="비교할 질문"
@@ -889,6 +1029,13 @@ export function RagSetupPage() {
             onClick={() => setActiveCandidateId(candidate.id)}
           >
             후보 {index + 1}: {candidate.plainLabel}
+            {candidate.comparisonState === 'PREPARING'
+              ? ' · 준비 중'
+              : candidate.comparisonState === 'FAILED'
+                ? ' · 준비 실패'
+                : candidate.comparisonState === 'NO_EVIDENCE'
+                  ? ' · 근거 없음'
+                  : ''}
             {selected.includes(candidate.id) ? ' · 선택됨' : ''}
           </button>
         ))}
@@ -904,16 +1051,19 @@ export function RagSetupPage() {
               evidenceTriggerRef.current = trigger;
               setEvidence(candidate);
             }}
+            onRetryPreparation={() => void retryPreparation()}
+            canRetryPreparation={Boolean(detail.latestJob?.canRetry)}
           />
         ))}
       </CompareGrid>
       <Bar>
         <div>
-          <strong style={{ fontSize: 13 }}>현재 {selected.length}개 선택</strong>
+          <strong style={{ fontSize: 13 }}>
+            준비됨 {selectableCandidateIds.size}/{counts.length} · 이번 라운드 {selected.length}개
+            선택
+          </strong>
           <div id="tie-help" style={{ fontSize: 12, color: theme.colors.muted, marginTop: 3 }}>
-            {winner
-              ? `${winner.label} 조합이 단독 1위예요.`
-              : '아직 한 가지 방식이 앞서지 않았어요. 다음 질문에서도 비교해 주세요.'}
+            {completionDisabledReason ?? `${winner?.label} 조합이 단독 1위예요.`}
           </div>
         </div>
         <div className="bar-actions" style={{ display: 'flex', gap: 8 }}>
@@ -925,7 +1075,7 @@ export function RagSetupPage() {
             {compareSubmitting ? '비교 중…' : '다음 라운드 진행'}
           </Button>
           <Button
-            disabled={!winner}
+            disabled={!winner || finalizeSubmitting}
             aria-describedby="tie-help"
             onClick={(event) => {
               confirmTriggerRef.current = event.currentTarget;

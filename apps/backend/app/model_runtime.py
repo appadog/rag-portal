@@ -59,6 +59,15 @@ MODEL_SERVICES = (
         description="hybrid top-k 근거를 재정렬하는 cross-encoder",
     ),
     ModelService(
+        key="generator-grounded",
+        technique="grounded_generation",
+        model_id="configured-local-generator",
+        runtime="openai-compatible-or-custom-http",
+        endpoint_env="RAG_GENERATOR_URL",
+        used_by=("answer_generation", "tuning_comparison"),
+        description="검색된 근거 ID만 인용하도록 강제하는 로컬 생성 모델",
+    ),
+    ModelService(
         key="ocr-tesseract-kor-eng",
         technique="ocr",
         model_id="tesseract:kor+eng",
@@ -139,6 +148,7 @@ def execution_plan(
         required_keys.append("ocr-tesseract-kor-eng")
     if "hybrid_rerank" in retrievals:
         required_keys.append("reranker-bge-m3")
+    required_keys.append("generator-grounded")
     requirements = [service_status(service_for_key(key)) for key in required_keys if service_for_key(key)]
     return {
         "embedding_model": embedding_model,

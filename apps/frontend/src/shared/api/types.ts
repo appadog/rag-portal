@@ -8,6 +8,22 @@ export type ProcessingStage =
 export type RetrievalConfig = 'HYBRID' | 'HYBRID_RERANK' | 'DENSE' | 'BM25';
 export type ChunkingStrategy = 'ARTICLE' | 'HIERARCHICAL' | 'SEMANTIC' | 'FIXED';
 
+export interface Citation {
+  id: string;
+  title: string;
+  excerpt: string;
+  page: string;
+  navigateUrl?: string;
+  documentId?: string;
+  documentName?: string;
+}
+
+export interface SearchDocumentCoverage {
+  documentId?: string;
+  documentName: string;
+  citationCount: number;
+}
+
 export interface RagDocument {
   id: string;
   name: string;
@@ -15,6 +31,9 @@ export interface RagDocument {
   status: 'UPLOADED' | 'PARSING' | 'PARSED' | 'FAILED';
   pipelineLabel?: string;
   pipelineId?: string;
+  comparisonScope?: 'FULL' | 'SAMPLE';
+  estimatedChunkCount?: number;
+  comparisonChunkCount?: number;
 }
 
 export interface RagInstance {
@@ -58,12 +77,28 @@ export interface PipelineCandidate {
   chunkCount?: number;
   latencyMs: number;
   answer: string;
-  evidence: { id: string; title: string; excerpt: string; page: string; navigateUrl?: string }[];
+  evidence: Citation[];
+  preparation?: {
+    state: 'PREPARING' | 'READY' | 'FAILED';
+    ready: boolean;
+    error?: string;
+    preparedAt?: string;
+  };
+  comparisonState?: 'READY' | 'NO_EVIDENCE' | 'PREPARING' | 'FAILED';
+  comparisonStateDetail?: string;
+  generation?: GroundedGenerationMetadata;
   runtime?: {
     provider?: string;
     warning?: string;
     fallback: boolean;
   };
+}
+
+export interface GroundedGenerationMetadata {
+  status?: string;
+  fallback: boolean;
+  provider?: string;
+  detail?: string;
 }
 
 export interface ModelServiceStatus {
@@ -99,6 +134,7 @@ export interface RagInstanceDetail extends RagInstance {
   candidates: PipelineCandidate[];
   lastRound?: ComparisonRound;
   latestJob?: RagProcessingJob;
+  fullReindexJob?: RagProcessingJob;
 }
 
 export interface CreateRagInput {
@@ -120,9 +156,32 @@ export interface EmbeddingModelRecommendation {
   recommended: boolean;
 }
 
+export interface EmbeddingBenchmarkRun {
+  id: string;
+  corpusLabel: string;
+  queryCount: number;
+  createdAt: string;
+}
+
+export interface EmbeddingBenchmarkResult {
+  modelId: string;
+  recallAt1: number | null;
+  recallAt5: number | null;
+  mrr: number | null;
+  averageLatencyMs: number | null;
+  dimension: number | null;
+  provider: string;
+  status: string;
+}
+
+export interface EmbeddingBenchmark {
+  run: EmbeddingBenchmarkRun;
+  results: EmbeddingBenchmarkResult[];
+}
+
 export interface ChatAnswer {
   text: string;
-  citations: { id: string; title: string; excerpt: string; page: string; navigateUrl?: string }[];
+  citations: Citation[];
   latencyMs: number;
   context?: SearchContextSnapshot;
   artifactId?: string;
@@ -131,4 +190,6 @@ export interface ChatAnswer {
     warning?: string;
     fallback: boolean;
   };
+  generation?: GroundedGenerationMetadata;
+  documentCoverage?: SearchDocumentCoverage[];
 }

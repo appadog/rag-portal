@@ -71,6 +71,8 @@ npm run build
 
 - Interactive API: [http://127.0.0.1:8010/docs](http://127.0.0.1:8010/docs)
 - OpenAPI: [http://127.0.0.1:8010/api/v1/openapi.json](http://127.0.0.1:8010/api/v1/openapi.json)
+- **기능 명세서·인계 문서:** [docs/FEATURE_SPECIFICATION.md](docs/FEATURE_SPECIFICATION.md)
+- **개발 백로그·스프린트 순서:** [RAG_PORTAL_FEATURE_PLAN.md](RAG_PORTAL_FEATURE_PLAN.md)
 - Backend contract: [apps/backend/README.md](apps/backend/README.md)
 - Adaptive chunking policy: [docs/SPRINT_05_ADAPTIVE_CHUNKING.md](docs/SPRINT_05_ADAPTIVE_CHUNKING.md)
 - Product decisions: [docs/PRODUCT_MVP_DECISIONS.md](docs/PRODUCT_MVP_DECISIONS.md)

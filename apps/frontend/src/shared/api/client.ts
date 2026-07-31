@@ -1,9 +1,13 @@
 import type {
   ChatAnswer,
+  Citation,
   ComparisonRound,
   CreateRagInput,
+  EmbeddingBenchmark,
+  EmbeddingBenchmarkResult,
   EmbeddingModelRecommendation,
   ExecutionPlan,
+  GroundedGenerationMetadata,
   ModelServiceStatus,
   PipelineCandidate,
   RagDocument,
@@ -11,6 +15,7 @@ import type {
   RagInstanceDetail,
   RagProcessingJob,
   RetrievalConfig,
+  SearchDocumentCoverage,
 } from './types';
 import { candidateFixtures, mockInstances, mockRound } from '../mocks/ragFixtures';
 
@@ -29,7 +34,7 @@ function base64FromBytes(bytes: Uint8Array): string {
 
 export type AnswerStreamOptions = {
   signal?: AbortSignal;
-  onUpdate?: (answer: Pick<ChatAnswer, 'text' | 'citations'>) => void;
+  onUpdate?: (answer: Pick<ChatAnswer, 'text' | 'citations' | 'generation'>) => void;
 };
 
 function abortable<T>(operation: Promise<T>, signal?: AbortSignal): Promise<T> {
@@ -95,6 +100,34 @@ function locationLabel(location: unknown, fallback: unknown = ''): string {
   return fallback ? `${String(fallback)}번째 문서 조각` : '문서 원문';
 }
 
+function citationFromWire(citation: Json): Citation {
+  const documentName =
+    typeof citation.document_name === 'string'
+      ? citation.document_name
+      : typeof citation.filename === 'string'
+        ? citation.filename
+        : undefined;
+  return {
+    id: String(citation.segment_id),
+    title: String(citation.filename ?? documentName ?? '문서 근거'),
+    excerpt: String(citation.excerpt),
+    page: locationLabel(citation.location, citation.ordinal),
+    navigateUrl: typeof citation.navigate_url === 'string' ? citation.navigate_url : undefined,
+    documentId: typeof citation.document_id === 'string' ? citation.document_id : undefined,
+    documentName,
+  };
+}
+
+function coverageFromWire(data: Json): SearchDocumentCoverage[] | undefined {
+  const coverage = data.document_coverage as Json[] | undefined;
+  if (!coverage?.length) return undefined;
+  return coverage.map((item) => ({
+    documentId: typeof item.document_id === 'string' ? item.document_id : undefined,
+    documentName: String(item.document_name ?? item.filename ?? '문서 근거'),
+    citationCount: Number(item.citation_count ?? item.citations ?? 0),
+  }));
+}
+
 function jobFromWire(job: Json | undefined): RagProcessingJob | undefined {
   if (!job) return undefined;
   const progress = (job.progress as Json | undefined) ?? {};
@@ -158,9 +191,59 @@ function runtimeFromWire(metadata: Json | undefined, candidate: Json | undefined
   };
 }
 
+function generationFromWire(metadata: Json | undefined): GroundedGenerationMetadata | undefined {
+  const generation =
+    (metadata?.generation_metadata as Json | undefined) ??
+    (metadata?.generation as Json | undefined) ??
+    metadata;
+  const status =
+    typeof generation?.status === 'string'
+      ? generation.status
+      : typeof generation?.state === 'string'
+        ? generation.state
+        : typeof metadata?.generation_status === 'string'
+          ? metadata.generation_status
+          : undefined;
+  const provider = typeof generation?.provider === 'string' ? generation.provider : undefined;
+  const detail =
+    typeof generation?.detail === 'string'
+      ? generation.detail
+      : typeof generation?.message === 'string'
+        ? generation.message
+        : undefined;
+  const fallback =
+    typeof generation?.fallback === 'boolean'
+      ? generation.fallback
+      : typeof generation?.mode === 'string'
+        ? generation.mode.toLowerCase().includes('fallback') ||
+          generation.mode.toLowerCase().includes('extractive')
+        : false;
+  return status || provider || detail || fallback
+    ? { status, fallback, provider, detail }
+    : undefined;
+}
+
 function pipelineFromWire(candidate: Json, result?: Json): PipelineCandidate {
   const citations = (result?.citations as Json[] | undefined) ?? [];
   const hasEvidence = citations.length > 0;
+  const preparationWire = candidate.preparation as Json | undefined;
+  const preparation = preparationWire
+    ? {
+        state: String(preparationWire.state) as 'PREPARING' | 'READY' | 'FAILED',
+        ready: Boolean(preparationWire.ready),
+        error: typeof preparationWire.error === 'string' ? preparationWire.error : undefined,
+        preparedAt:
+          typeof preparationWire.prepared_at === 'string' ? preparationWire.prepared_at : undefined,
+      }
+    : undefined;
+  const comparisonState = String(
+    result?.candidate_state ??
+      (preparation?.state === 'PREPARING' || preparation?.state === 'FAILED'
+        ? preparation.state
+        : hasEvidence
+          ? 'READY'
+          : 'NO_EVIDENCE'),
+  ) as PipelineCandidate['comparisonState'];
   return {
     id: String(candidate.id),
     chunkingStrategy: chunkMap[String(candidate.chunking_strategy)] ?? 'FIXED',
@@ -174,13 +257,14 @@ function pipelineFromWire(candidate: Json, result?: Json): PipelineCandidate {
     answer: String(
       result?.answer ?? (hasEvidence ? '근거를 준비하고 있어요.' : '아직 비교 질문이 없어요.'),
     ),
-    evidence: citations.map((citation) => ({
-      id: String(citation.segment_id),
-      title: String(citation.filename),
-      excerpt: String(citation.excerpt),
-      page: locationLabel(citation.location, citation.ordinal),
-      navigateUrl: typeof citation.navigate_url === 'string' ? citation.navigate_url : undefined,
-    })),
+    evidence: citations.map(citationFromWire),
+    preparation,
+    comparisonState,
+    comparisonStateDetail:
+      typeof result?.candidate_state_detail === 'string'
+        ? result.candidate_state_detail
+        : preparation?.error,
+    generation: generationFromWire(result),
     runtime: runtimeFromWire(result?.retrieval_metadata as Json | undefined, candidate),
   };
 }
@@ -198,6 +282,18 @@ function instanceFromWire(item: Json, detail = false): RagInstanceDetail {
       status: 'PARSED',
       pipelineLabel: finalized ? pipelineFromWire(finalized).label : undefined,
       pipelineId: finalized ? String(finalized.id) : undefined,
+      comparisonScope:
+        document.comparison_scope === 'SAMPLE' || document.comparison_scope === 'FULL'
+          ? document.comparison_scope
+          : undefined,
+      estimatedChunkCount:
+        typeof document.estimated_chunk_count === 'number'
+          ? document.estimated_chunk_count
+          : undefined,
+      comparisonChunkCount:
+        typeof document.comparison_chunk_count === 'number'
+          ? document.comparison_chunk_count
+          : undefined,
     };
   });
   const candidates = rawDocs.flatMap((document) =>
@@ -206,6 +302,9 @@ function instanceFromWire(item: Json, detail = false): RagInstanceDetail {
     ),
   );
   const latestJob = jobFromWire(item.latest_job as Json | undefined);
+  const fullReindexJob = jobFromWire(
+    (item.pending_full_reindex_job ?? item.full_reindex_job) as Json | undefined,
+  );
   const latestRound = item.latest_round as Json | undefined;
   const lastRound = latestRound
     ? {
@@ -234,6 +333,7 @@ function instanceFromWire(item: Json, detail = false): RagInstanceDetail {
         }
       : undefined,
     latestJob: detail ? latestJob : undefined,
+    fullReindexJob: detail ? fullReindexJob : undefined,
     lastRound,
   };
 }
@@ -254,6 +354,35 @@ function recommendationFromWire(item: Json): EmbeddingModelRecommendation {
     reason: String(item.reason),
     tradeoff: String(item.tradeoff),
     recommended: Boolean(item.recommended),
+  };
+}
+
+function benchmarkResultFromWire(item: Json): EmbeddingBenchmarkResult {
+  const numberOrNull = (value: unknown) => (typeof value === 'number' ? value : null);
+  return {
+    modelId: String(item.model_id),
+    recallAt1: numberOrNull(item.recall_at_1),
+    recallAt5: numberOrNull(item.recall_at_5),
+    mrr: numberOrNull(item.mrr),
+    averageLatencyMs: numberOrNull(item.average_latency_ms),
+    dimension: numberOrNull(item.dimension),
+    provider: String(item.provider ?? '알 수 없음'),
+    status: String(item.status ?? 'UNKNOWN'),
+  };
+}
+
+function benchmarkFromWire(data: Json): EmbeddingBenchmark | undefined {
+  const run = data.run as Json | undefined;
+  const results = data.results as Json[] | undefined;
+  if (!run || !results?.length) return undefined;
+  return {
+    run: {
+      id: String(run.id),
+      corpusLabel: String(run.corpus_label ?? '우리 문서'),
+      queryCount: Number(run.query_count ?? 0),
+      createdAt: String(run.created_at ?? ''),
+    },
+    results: results.map(benchmarkResultFromWire),
   };
 }
 
@@ -290,6 +419,13 @@ function fallbackRecommendations(
 }
 
 export const ragApi = {
+  async latestEmbeddingBenchmark(): Promise<EmbeddingBenchmark | undefined> {
+    try {
+      return benchmarkFromWire(await request<Json>('/api/v1/embedding-benchmarks/latest'));
+    } catch {
+      return undefined;
+    }
+  },
   async modelRuntime(): Promise<ModelServiceStatus[]> {
     try {
       const data = await request<{ services?: Json[]; items?: Json[] }>('/api/v1/model-runtime');
@@ -501,17 +637,12 @@ export const ragApi = {
       });
       return {
         text: String(data.answer),
-        citations: ((data.citations as Json[]) ?? []).map((citation) => ({
-          id: String(citation.segment_id),
-          title: String(citation.filename),
-          excerpt: String(citation.excerpt),
-          page: locationLabel(citation.location, citation.ordinal),
-          navigateUrl:
-            typeof citation.navigate_url === 'string' ? citation.navigate_url : undefined,
-        })),
+        citations: ((data.citations as Json[]) ?? []).map(citationFromWire),
         latencyMs: 0,
         artifactId: String((data.artifact as Json | undefined)?.id ?? '') || undefined,
         runtime: runtimeFromWire(data.retrieval_metadata as Json | undefined, undefined),
+        generation: generationFromWire(data),
+        documentCoverage: coverageFromWire(data),
       };
     } catch {
       await wait(400);
@@ -548,6 +679,7 @@ export const ragApi = {
       const startedAt = Date.now();
       let text = '';
       let citations: ChatAnswer['citations'] = [];
+      let generation: ChatAnswer['generation'];
       let settled = false;
       const finish = (callback: () => void) => {
         if (settled) return;
@@ -558,18 +690,22 @@ export const ragApi = {
       };
       const abort = () =>
         finish(() => reject(new DOMException('답변 생성을 중단했어요.', 'AbortError')));
-      const publish = () => options.onUpdate?.({ text, citations });
+      const publish = () => options.onUpdate?.({ text, citations, generation });
+      const updateGeneration = (event: Event) => {
+        try {
+          generation = generationFromWire(JSON.parse((event as MessageEvent<string>).data) as Json);
+          publish();
+        } catch {
+          // Generation metadata is optional; preserve the current stream state when malformed.
+        }
+      };
+      source.addEventListener('generation', updateGeneration);
+      source.addEventListener('generation_status', updateGeneration);
+      source.addEventListener('status', updateGeneration);
       source.addEventListener('citations', (event) => {
         try {
           citations = (JSON.parse((event as MessageEvent<string>).data) as Json[]).map(
-            (citation) => ({
-              id: String(citation.segment_id),
-              title: String(citation.filename),
-              excerpt: String(citation.excerpt),
-              page: locationLabel(citation.location, citation.ordinal),
-              navigateUrl:
-                typeof citation.navigate_url === 'string' ? citation.navigate_url : undefined,
-            }),
+            citationFromWire,
           );
           publish();
         } catch {
@@ -598,6 +734,8 @@ export const ragApi = {
             latencyMs: Date.now() - startedAt,
             artifactId: String(metadata.artifact_id ?? '') || undefined,
             runtime: runtimeFromWire(metadata.retrieval_metadata as Json | undefined, undefined),
+            generation: generationFromWire(metadata) ?? generation,
+            documentCoverage: coverageFromWire(metadata),
           });
         }),
       );

@@ -23,7 +23,7 @@ import { theme } from '../../shared/styles/theme';
 
 type PanelName = 'context' | 'output';
 type OutputView = 'evidence' | 'settings' | 'documents';
-type StreamingAnswer = Pick<ChatAnswer, 'text' | 'citations'> & {
+type StreamingAnswer = Pick<ChatAnswer, 'text' | 'citations' | 'generation'> & {
   question: string;
   context: SearchContextSnapshot;
   state: 'streaming' | 'interrupted' | 'failed';
@@ -39,6 +39,15 @@ const sensitivityLabels: Record<string, string> = {
   balanced: '평이하게',
   strict: '엄격하게',
 };
+
+function generationStatusCopy(status?: string) {
+  const normalized = status?.toLowerCase();
+  if (normalized?.includes('ground') || normalized?.includes('evidence'))
+    return '문서 근거를 연결하고 있어요.';
+  if (normalized?.includes('generat') || normalized?.includes('answer'))
+    return '문서 근거를 바탕으로 답을 정리하고 있어요.';
+  return '문서에서 근거를 확인하고 있어요.';
+}
 
 const DetailPage = styled.div`
   display: flex;
@@ -279,6 +288,12 @@ const WorkBody = styled.section`
     font-size: var(--rp-font-size-12);
     color: var(--rp-ink-muted);
   }
+  .source-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--rp-space-2);
+    margin-top: var(--rp-space-3);
+  }
   .stream-status {
     margin: var(--rp-space-2) 0 0;
     color: var(--rp-ink-muted);
@@ -415,6 +430,23 @@ const OutputBody = styled.aside`
     min-width: 0;
     overflow-wrap: anywhere;
   }
+  .evidence-list {
+    display: grid;
+    gap: var(--rp-space-2);
+  }
+  .evidence-list button {
+    padding: var(--rp-space-2);
+    border: 1px solid var(--rp-border);
+    border-radius: var(--rp-radius-sm);
+    background: var(--rp-surface);
+    color: var(--rp-ink);
+    font-size: var(--rp-font-size-12);
+    text-align: left;
+  }
+  .evidence-list button[aria-pressed='true'] {
+    border-color: var(--rp-border-focus);
+    background: var(--rp-surface-selected);
+  }
 `;
 const DialogOverlay = styled.div`
   position: fixed;
@@ -503,6 +535,7 @@ export function RagDetailPage() {
   );
   const [view, setView] = useState<OutputView>('settings');
   const [evidence, setEvidence] = useState<PipelineCandidate>();
+  const [evidenceIndex, setEvidenceIndex] = useState(0);
   const [dialog, setDialog] = useState<'add' | 'delete' | undefined>();
   const [targetId, setTargetId] = useState<string>();
   const [files, setFiles] = useState<File[]>([]);
@@ -517,6 +550,7 @@ export function RagDetailPage() {
   }>();
   const [evidenceLoadError, setEvidenceLoadError] = useState<string>();
   const [feedback, setFeedback] = useState<1 | -1>();
+  const [reindexRetrying, setReindexRetrying] = useState(false);
   const evidenceHeadingRef = useRef<HTMLHeadingElement | null>(null);
   const evidenceTriggerRef = useRef<HTMLButtonElement | null>(null);
   const dialogRef = useRef<HTMLDivElement | null>(null);
@@ -580,11 +614,18 @@ export function RagDetailPage() {
   }, [dialog]);
   useEffect(() => () => answerAbortRef.current?.abort(), []);
   useEffect(() => {
-    const jobState = detail?.latestJob?.state;
-    if (!jobState || jobState === 'SUCCEEDED' || jobState === 'FAILED') return;
+    const activeJob = [detail?.latestJob, detail?.fullReindexJob].some(
+      (job) => job && !['SUCCEEDED', 'FAILED', 'CANCELLED'].includes(job.state),
+    );
+    if (!activeJob) return;
     const timer = window.setInterval(load, 2000);
     return () => window.clearInterval(timer);
-  }, [detail?.latestJob?.id, detail?.latestJob?.state]);
+  }, [
+    detail?.latestJob?.id,
+    detail?.latestJob?.state,
+    detail?.fullReindexJob?.id,
+    detail?.fullReindexJob?.state,
+  ]);
   if (error) return <ErrorState message={error} retry={load} />;
   if (!detail) return <LoadingState label="지식 공간과 문서를 불러오고 있어요…" />;
   const toggleDocument = (documentId: string) => {
@@ -633,7 +674,14 @@ export function RagDetailPage() {
     setBusy(true);
     setQueryError(undefined);
     setFailedSearch(undefined);
-    setStreamingAnswer({ question, text: '', citations: [], context, state: 'streaming' });
+    setStreamingAnswer({
+      question,
+      text: '',
+      citations: [],
+      generation: { status: 'GROUNDING', fallback: false },
+      context,
+      state: 'streaming',
+    });
     try {
       const nextAnswer = await ragApi.streamAnswer(
         id,
@@ -667,6 +715,16 @@ export function RagDetailPage() {
     }
   };
   const stopAnswer = () => answerAbortRef.current?.abort();
+  const retryFullReindex = async () => {
+    if (!detail.fullReindexJob?.canRetry || reindexRetrying) return;
+    setReindexRetrying(true);
+    try {
+      await ragApi.retryJob(detail.fullReindexJob.id);
+      setDetail(await ragApi.get(id));
+    } finally {
+      setReindexRetrying(false);
+    }
+  };
   const contextSummary = (context: SearchContextSnapshot) =>
     `${context.documentNames.join(', ') || '선택한 문서'} · ${sensitivityLabels[context.sensitivity] ?? context.sensitivity}`;
   const leaveFeedback = async (rating: 1 | -1) => {
@@ -720,13 +778,21 @@ export function RagDetailPage() {
     evidenceTriggerRef.current = trigger;
     showPanel('output');
     setEvidence(candidate);
+    setEvidenceIndex(0);
     setEvidenceLoadError(undefined);
     const navigateUrl = candidate.evidence[0]?.navigateUrl;
     if (navigateUrl) {
       try {
         const source = await ragApi.evidence(navigateUrl);
         setEvidence((current) =>
-          current ? { ...current, evidence: [{ ...current.evidence[0], ...source }] } : current,
+          current
+            ? {
+                ...current,
+                evidence: current.evidence.map((item, index) =>
+                  index === 0 ? { ...item, ...source } : item,
+                ),
+              }
+            : current,
         );
       } catch (item) {
         setEvidenceLoadError((item as Error).message);
@@ -761,6 +827,27 @@ export function RagDetailPage() {
     }
   };
   const readyDocuments = detail.documents.filter((document) => document.pipelineId);
+  const citationGroups = answer
+    ? Object.values(
+        answer.citations.reduce<
+          Record<string, { documentName: string; citations: ChatAnswer['citations'] }>
+        >((groups, citation) => {
+          const key = citation.documentId ?? citation.documentName ?? citation.title;
+          const group = groups[key] ?? {
+            documentName: citation.documentName ?? citation.title,
+            citations: [],
+          };
+          group.citations.push(citation);
+          groups[key] = group;
+          return groups;
+        }, {}),
+      )
+    : [];
+  const coveredDocumentCount =
+    answer?.documentCoverage?.filter((coverage) => coverage.citationCount > 0).length ??
+    citationGroups.length;
+  const activeEvidenceCitation = evidence?.evidence[evidenceIndex];
+  const fullReindexJob = detail.fullReindexJob;
   const outputIsDrawer = viewportWidth < 1440;
   const contextIsDrawer = viewportWidth < 1024;
   const panelId = (panel: PanelName) => `rag-${id}-${panel}-panel`;
@@ -776,6 +863,24 @@ export function RagDetailPage() {
               {detail.latestJob.state === 'SUCCEEDED' ? '최근 문서 준비' : '문서 준비 중'}:{' '}
               {detail.latestJob.currentStep} · {detail.latestJob.completed}/{detail.latestJob.total}{' '}
               단계 완료
+            </p>
+          )}
+          {fullReindexJob && (
+            <p className="job-summary" role="status">
+              {fullReindexJob.state === 'SUCCEEDED'
+                ? '전체 문서 색인 완료: 현재 검색에 전체 문서가 반영됐어요.'
+                : fullReindexJob.state === 'FAILED'
+                  ? '전체 문서 색인을 마치지 못했어요. 현재 검색은 계속 사용할 수 있어요.'
+                  : `전체 문서 색인 중: ${fullReindexJob.currentStep} · ${fullReindexJob.completed}/${fullReindexJob.total} 단계 완료`}
+              {fullReindexJob.state === 'FAILED' && fullReindexJob.canRetry && (
+                <Button
+                  $variant="ghost"
+                  onClick={() => void retryFullReindex()}
+                  disabled={reindexRetrying}
+                >
+                  {reindexRetrying ? '전체 색인 다시 준비 중…' : '전체 색인 다시 시도'}
+                </Button>
+              )}
             </p>
           )}
         </div>
@@ -907,6 +1012,47 @@ export function RagDetailPage() {
                         {answer.runtime.warning ?? answer.runtime.provider}
                       </div>
                     )}
+                    {answer.generation && (
+                      <div className="answer-meta" role="status">
+                        {answer.generation.fallback
+                          ? `문서 근거를 바탕으로 발췌한 결과예요${answer.generation.detail ? ` · ${answer.generation.detail}` : ''}`
+                          : '문서 근거를 바탕으로 정리한 답변이에요.'}
+                      </div>
+                    )}
+                    {citationGroups.length > 1 && (
+                      <>
+                        <div className="answer-meta" role="status">
+                          {coveredDocumentCount}개 문서의 근거를 함께 확인했어요.
+                        </div>
+                        <div className="source-actions" aria-label="문서별 인용 근거">
+                          {citationGroups.map((group) => (
+                            <Button
+                              key={group.documentName}
+                              $variant="ghost"
+                              onClick={(event) =>
+                                void openEvidence(
+                                  {
+                                    id: `source-${group.documentName}`,
+                                    chunkingStrategy: 'FIXED',
+                                    retrievalConfig: 'HYBRID',
+                                    label: group.documentName,
+                                    plainLabel: '문서 근거',
+                                    description: '답변에 인용된 문서 근거',
+                                    selectionCount: 0,
+                                    latencyMs: 0,
+                                    answer: '',
+                                    evidence: group.citations,
+                                  },
+                                  event.currentTarget,
+                                )
+                              }
+                            >
+                              {group.documentName} 근거 {group.citations.length}개 보기
+                            </Button>
+                          ))}
+                        </div>
+                      </>
+                    )}
                     <div className="feedback-actions" aria-label="검색 결과 피드백">
                       <Button
                         $variant="ghost"
@@ -942,11 +1088,12 @@ export function RagDetailPage() {
                 <>
                   <div className="message user">{streamingAnswer.question}</div>
                   <div className={`message ${streamingAnswer.state}`}>
-                    {streamingAnswer.text || '문서에서 근거를 확인하고 있어요…'}
+                    {streamingAnswer.text ||
+                      `${generationStatusCopy(streamingAnswer.generation?.status)}…`}
                     {streamingAnswer.citations.map(citationButton)}
                     <p className="stream-status" role="status">
                       {streamingAnswer.state === 'streaming'
-                        ? '검색 결과와 근거를 준비하고 있어요. 필요하면 중단할 수 있어요.'
+                        ? `${generationStatusCopy(streamingAnswer.generation?.status)} 필요하면 중단할 수 있어요.`
                         : streamingAnswer.state === 'interrupted'
                           ? '검색 결과 표시를 중단했어요. 답변 생성을 중단했어요. 지금까지 받은 내용은 남아 있어요.'
                           : '검색 결과 연결이 끊겼어요. 지금까지 받은 내용을 확인하거나 다시 질문해 주세요.'}
@@ -1115,11 +1262,26 @@ export function RagDetailPage() {
               {view === 'evidence' ? (
                 evidence ? (
                   <>
-                    <Pill $tone="brand">{evidence.evidence[0]?.page}</Pill>
+                    {evidence.evidence.length > 1 && (
+                      <div className="evidence-list" role="list" aria-label="이 문서의 인용 근거">
+                        {evidence.evidence.map((citation, index) => (
+                          <button
+                            key={citation.id}
+                            type="button"
+                            role="listitem"
+                            aria-pressed={evidenceIndex === index}
+                            onClick={() => setEvidenceIndex(index)}
+                          >
+                            {citation.page} · {citation.excerpt.slice(0, 56)}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                    <Pill $tone="brand">{activeEvidenceCitation?.page}</Pill>
                     <h2 ref={evidenceHeadingRef} tabIndex={-1}>
-                      {evidence.evidence[0]?.title}
+                      {activeEvidenceCitation?.title}
                     </h2>
-                    <p className="excerpt">{evidence.evidence[0]?.excerpt}</p>
+                    <p className="excerpt">{activeEvidenceCitation?.excerpt}</p>
                     {evidenceLoadError && (
                       <div className="excerpt" role="alert">
                         <p>{evidenceLoadError}</p>

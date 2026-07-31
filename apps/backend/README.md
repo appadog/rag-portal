@@ -29,6 +29,7 @@ The single source of truth for what is implemented versus what still needs to be
 | Lightweight self-hosted embedding | `Qwen/Qwen3-Embedding-0.6B` | `qwen` / 8082 | `Qwen3-Embedding-0.6B` |
 | Small-footprint embedding | `google/embeddinggemma-300m` | `gemma` / 8083 | `EmbeddingGemma-300M` |
 | Cross-encoder reranker | `BAAI/bge-reranker-v2-m3` | `reranker` / 8084 | `hybrid_rerank` |
+| Grounded answer generation | configured local generator | custom `/generate` / 8085 | search and tuning comparison |
 | OCR language data | Tesseract `kor` + `eng` | host package | scanned PDF/image |
 
 Download and run only the embedding profile(s) your development server needs, plus the shared reranker:
@@ -38,6 +39,8 @@ docker compose -f docker-compose.models.yml --profile bge --profile reranker up 
 ```
 
 The first start downloads model weights into the named volume. Copy `.env.example` to `.env`, then run Uvicorn with `--env-file .env` so the API is pointed at the matching local services. TEI exposes `/embed` for embeddings and `/rerank` for a model-backed cross-encoder reranker. [Hugging Face TEI quick tour](https://huggingface.co/docs/text-embeddings-inference/en/quick_tour)
+
+The generator is a separately configured local service (`RAG_GENERATOR_URL`). It receives only retrieved `{segment_id, text}` context and must return sentence-level `citation_ids`; [Sprint 09](../../docs/SPRINT_09_GROUNDED_GENERATION.md) defines the HTTP contract and fallback behavior. For multiple finalized documents, each source is retrieved with its own finalized configuration, normalized before the global merge, and only the bounded selected context is sent to the generator; see [Sprint 10](../../docs/SPRINT_10_MULTI_DOCUMENT_SEARCH.md).
 
 ## Optional external integrations
 
@@ -55,19 +58,20 @@ Base URL: `http://127.0.0.1:8010/api/v1`
 | --- | --- | --- |
 | Model recommendations | `POST /rag-instances/embedding-recommendations` | Returns three ranked, explainable model candidates before a user chooses one. |
 | Model runtime | `GET /model-runtime` | Lists every parser/OCR/embedding/reranker service, its endpoint, and readiness state. |
+| Large-document policy | `GET /large-document-policy` | Returns the configurable comparison chunk threshold (default 500) and sampling rule. |
 | Execution plan | `GET /rag-instances/{id}/execution-plan` | Resolves the model services required by that instance's selected embedding model, document profiles, and retrieval techniques. |
 | Dashboard | `GET/POST /rag-instances` | POST creates a `SETTING_UP` instance and persists the model selected from the candidate set. |
 | Detail | `GET /rag-instances/{id}` | Includes documents, candidates, final choice. |
 | Add mode choices | `GET /rag-instances/{id}/document-add-options` | Explains whether an existing finalized pipeline can be reused, and lists its eligible source documents. |
-| Upload + process | `POST /rag-instances/{id}/documents` | JSON `documents[]` plus explicit `pipeline_mode`; returns a queued job immediately, then parser/candidate/index preparation proceeds in the background. |
+| Upload + process | `POST /rag-instances/{id}/documents` | JSON `documents[]` plus explicit `pipeline_mode`; decision/job metadata expose `FULL` or bounded `SAMPLE` comparison counts, then parser/candidate/index preparation proceeds in the background. |
 | Job polling | `GET /rag-jobs/{jobId}` / `GET /rag-instances/{id}/jobs` | State, completed stages, actual progress, retry/cancel availability, and linked artifact. |
 | Job control | `POST /rag-jobs/{jobId}/cancel` / `POST /rag-jobs/{jobId}/retry` | Stops an active preparation at a safe stage boundary or retries a failed/cancelled job with the original input. |
 | Comparison | `POST /rag-instances/{id}/tuning/compare` | Returns 9 (3 chunking × 3 retrieval) answer cards per document with inline citations. Each candidate searches its own prepared chunks. |
 | Vote | `POST /tuning-rounds/{id}/vote` | Multiple candidate IDs allowed. |
 | Status | `GET /rag-instances/{id}/tuning-status?document_ids=id` | `can_finalize` only becomes true for a unique leader. |
-| Finalize | `POST /rag-instances/{id}/tuning/finalize` | Deletes temporary losing candidates and records the winner. |
-| Search | `POST /rag-instances/{id}/search` | Finalized documents only; default sensitivity is `balanced`. |
-| Search stream | `GET /rag-instances/{id}/search/stream` | SSE events: `citations`, `token`, `done`. |
+| Finalize | `POST /rag-instances/{id}/tuning/finalize` | Deletes temporary losing candidates and records the winner; a sampled document also receives a persisted `FULL_REINDEX` job/artifact. |
+| Search | `POST /rag-instances/{id}/search` | Finalized documents only; default sensitivity is `balanced`. Multi-document searches return flat compatibility citations plus `grouped_citations` and explainable per-document merge/rerank metadata. |
+| Search stream | `GET /rag-instances/{id}/search/stream` | SSE events: `citations`, token stream, `done`; `done.generation` exposes model or explicit extractive-fallback state. |
 | Citation viewer | `GET /documents/{documentId}/segments/{segmentId}` | Opens source text at the exact cited offsets, with previous/next segment IDs. |
 | Artifacts | `GET /rag-instances/{id}/artifacts` / `GET,DELETE /rag-instances/{id}/artifacts/{artifactId}` | Processing runs, comparisons, decisions, and answers are explicit objects with status, timestamps, context, and actions. |
 | Feedback | `POST /rag-instances/{id}/feedback` / `GET /rag-instances/{id}/feedback-summary` | Optional answer/context feedback and an explicit re-tuning recommendation signal. |
@@ -107,8 +111,10 @@ Use `GET /rag-instances/{id}/document-add-options` before showing this choice. `
 - Upload automatically extracts PDF/DOCX/XLSX/text content (and uses OCR for scan/image sources when provisioned), profiles document shape, and creates 3 chunking × 3 retrieval candidates. Each candidate persists its own derived chunks and vector records, so structural, semantic, fixed-length, and table strategies are meaningfully comparable.
 - Candidate generation is bounded to nine comparable options, but is not a fixed template: parser output measures headings, paragraphs, table-like rows, source length, and OCR use. Those measurements select the three chunking strategies and calculate each candidate's chunk size, overlap, section cap, or rows-per-chunk. The API returns the calculation and its human-readable reason in `chunking_analysis`, `chunking_parameters`, and `selection_reason`.
 - Comparison gives answer-first cards with evidence; missing evidence refuses to fabricate an answer.
+- Retrieved context is passed to the local generator as the only source material. Every generated sentence must cite a supplied segment ID; endpoint failure or invalid grounding is replaced by a clearly labeled extractive fallback.
 - Multi-select vote accumulates counts. A tie cannot finalize.
 - Finalization retains only the winner per document. Search follows citations and supports a three-level sensitivity setting.
+- A `RETUNE` upload estimates chunks per strategy using `RAG_PORTAL_COMPARISON_CHUNK_THRESHOLD` (default `500`). Above that budget, candidate comparison uses deterministic source-wide samples while retaining the full source. Finalizing such a choice schedules a `FULL_REINDEX` job; search waits for that full index instead of serving the sample as a finished RAG.
 - Each finished operation creates an artifact object (`PROCESSING_RUN`, `TUNING_COMPARISON`, `PIPELINE_DECISION`, `ANSWER`, or `RETUNING_RUN`) suitable for an Output/Studio panel.
 - Citations include a focusable navigation URL and exact text offsets; the viewer response exposes neighbouring source segments without moving the core workspace.
 - Job stages are completed facts, not simulated percentages. The local worker parses uploaded text, creates profile-matched candidates, and prepares local retrieval state in the background.

@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import styled from 'styled-components';
 import { ragApi } from '../shared/api/client';
-import type { EmbeddingModelRecommendation } from '../shared/api/types';
+import type { EmbeddingBenchmark, EmbeddingModelRecommendation } from '../shared/api/types';
 import { Button, Card, Input, Pill } from '../shared/ui/primitives';
 import { theme } from '../shared/styles/theme';
 
@@ -128,6 +128,98 @@ const ModelChoice = styled.label<{ $selected: boolean }>`
     color: ${theme.colors.ink};
   }
 `;
+const BenchmarkPanel = styled.section`
+  margin: var(--rp-space-5) 0;
+  padding: var(--rp-space-4);
+  border: 1px solid var(--rp-border);
+  border-radius: var(--rp-radius-md);
+  background: var(--rp-surface-subtle);
+  h3 {
+    margin: 0;
+    font-size: var(--rp-font-size-16);
+  }
+  .meta,
+  .empty {
+    margin: var(--rp-space-2) 0 0;
+    color: var(--rp-ink-muted);
+    font-size: var(--rp-font-size-12);
+    line-height: var(--rp-line-normal);
+  }
+  .results {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr));
+    gap: var(--rp-space-3);
+    margin-top: var(--rp-space-3);
+  }
+  .result {
+    padding: var(--rp-space-3);
+    border: 1px solid var(--rp-border);
+    border-radius: var(--rp-radius-sm);
+    background: var(--rp-surface);
+  }
+  .result strong,
+  .result span {
+    display: block;
+  }
+  .result strong {
+    overflow-wrap: anywhere;
+    font-size: var(--rp-font-size-13);
+  }
+  .result span {
+    margin-top: var(--rp-space-1);
+    color: var(--rp-ink-muted);
+    font-size: var(--rp-font-size-12);
+  }
+`;
+
+function percent(value: number | null) {
+  if (value === null) return '측정 안 됨';
+  return `${(value <= 1 ? value * 100 : value).toFixed(1)}%`;
+}
+
+function BenchmarkSummary({
+  benchmark,
+  loading,
+}: {
+  benchmark?: EmbeddingBenchmark;
+  loading: boolean;
+}) {
+  return (
+    <BenchmarkPanel aria-live="polite" aria-busy={loading}>
+      <h3>우리 문서 실측 결과</h3>
+      {loading ? (
+        <p className="empty">실측 결과를 확인하고 있어요.</p>
+      ) : !benchmark ? (
+        <p className="empty">
+          아직 우리 문서 실측 결과를 실행하지 않았어요. 점수 없이 문서 특성 기반 추천만 보여드려요.
+        </p>
+      ) : (
+        <>
+          <p className="meta">
+            {benchmark.run.corpusLabel} · 질문 {benchmark.run.queryCount}개 ·{' '}
+            {benchmark.run.createdAt}
+          </p>
+          <div className="results" aria-label="임베딩 모델 실측 결과">
+            {benchmark.results.map((result) => (
+              <div className="result" key={result.modelId}>
+                <strong>{result.modelId}</strong>
+                <span>
+                  Recall@1 {percent(result.recallAt1)} · Recall@5 {percent(result.recallAt5)}
+                </span>
+                <span>
+                  MRR {percent(result.mrr)} · 평균 {result.averageLatencyMs ?? '측정 안 됨'}ms
+                </span>
+                <span>
+                  {result.provider} · {result.dimension ?? '차원 미측정'}차원 · {result.status}
+                </span>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+    </BenchmarkPanel>
+  );
+}
 
 export function RagCreatePage() {
   const navigate = useNavigate();
@@ -140,6 +232,8 @@ export function RagCreatePage() {
   const [recommendations, setRecommendations] = useState<EmbeddingModelRecommendation[]>([]);
   const [selectedModel, setSelectedModel] = useState('');
   const [loadingRecommendations, setLoadingRecommendations] = useState(false);
+  const [benchmark, setBenchmark] = useState<EmbeddingBenchmark>();
+  const [loadingBenchmark, setLoadingBenchmark] = useState(false);
   const questionnaire = {
     primaryLanguage: language,
     requiresOnPremise: privateData === 'yes',
@@ -148,13 +242,19 @@ export function RagCreatePage() {
   };
   const showRecommendations = async () => {
     setLoadingRecommendations(true);
+    setLoadingBenchmark(true);
     try {
-      const items = await ragApi.recommendEmbeddingModels(questionnaire);
+      const [items, latestBenchmark] = await Promise.all([
+        ragApi.recommendEmbeddingModels(questionnaire),
+        ragApi.latestEmbeddingBenchmark(),
+      ]);
       setRecommendations(items);
+      setBenchmark(latestBenchmark);
       setSelectedModel(items.find((item) => item.recommended)?.id ?? items[0]?.id ?? '');
       setStep(2);
     } finally {
       setLoadingRecommendations(false);
+      setLoadingBenchmark(false);
     }
   };
   const create = async () => {
@@ -266,6 +366,7 @@ export function RagCreatePage() {
             뒤에는 모든 문서가 같은 임베딩 공간을 사용합니다. 현재 로컬 미리보기 검색은 비교
             기준선인 lexical 방식으로 동작합니다.
           </p>
+          <BenchmarkSummary benchmark={benchmark} loading={loadingBenchmark} />
           <ModelChoices role="radiogroup" aria-label="임베딩 모델 후보">
             {recommendations.map((item) => (
               <ModelChoice key={item.id} $selected={selectedModel === item.id}>

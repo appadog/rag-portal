@@ -18,31 +18,87 @@
 5. **실사용·재방문** — 확정된 문서 범위를 선택해 검색하고, 인용 원문을 열며, 피드백·재튜닝 신호·산출물 이력을 저장한다.
 6. **모델 계약** — local TEI embedding/reranker, OCR, Redis의 readiness와 인스턴스별 실행 계획을 API로 노출한다.
 
-### 0.2 다음 개발 백로그 — 사용자 플로우 기준
+### 0.2 다음 개발 백로그 — 사용자 플로우·의존성 기준
 
-| 우선순위 | 플로우 | 남은 개발 항목 | 완료 조건 |
-| --- | --- | --- | --- |
-| P0 | 모델 준비 → 업로드 | 개발 서버에 선택 임베딩 모델 + reranker + Tesseract를 실제 기동하고, 문서 업로드부터 검색까지 fallback 없이 smoke test | `execution-plan`의 필수 서비스가 모두 `READY`, provider 메타데이터가 TEI/OCR 실사용을 표시 |
-| P0 | 품질 검증 → 모델 선택 | 대표 문서·질문·정답 근거로 embedding benchmark harness를 만든다. recall@k, latency, vector dimension/cost와 실행 설정을 저장한다. | 동일 corpus에서 BGE/Qwen/Gemma 결과를 재현 가능하게 비교하고, 추천 로직의 근거로 사용 |
-| P0 | 대형 문서 업로드 → 비교 | 예상 청크 수를 기준으로 전체 비교/샘플 비교를 분기하고, 확정 뒤에는 전체 문서를 재인덱싱한다. 시작값은 설정 가능한 500 chunks이며 실측으로 조정한다. | 대형 문서에서 처리 시간·비용이 통제되고, 사용자가 샘플 비교 상태를 알 수 있음 |
-| P1 | 비교 질문 → 답변 판단 | 현재의 extractive 답변 기준선을 실제 **근거 고정 생성 모델**로 교체한다. 모델 endpoint, citation-constrained prompt, 생성 취소와 진짜 토큰 스트리밍 계약을 추가한다. | 답변이 제공된 근거 밖 정보를 만들지 않고, 비교·실사용에서 동일한 grounded generation을 사용 |
-| P1 | 여러 문서 검색 → 답변 | 문서별 확정 파이프라인이 다른 경우의 전역 후보 병합, 점수 정규화, rerank top-k, 다문서 종합 답변을 구현한다. | 여러 문서를 선택해도 가장 좋은 근거들이 하나의 순위로 합쳐지고 citation이 보존됨 |
-| P1 | 피드백 → 재튜닝 | 부정 피드백 임계값과 관련도 임계값을 고정값이 아닌 관측 데이터로 보정하고, 재튜닝 권장 사유·변경 전후 품질을 보여준다. | 운영자가 기준을 조정할 수 있고 재튜닝 효과를 비교 가능 |
-| P1 | 문서 관리 → 재방문 | multipart/object storage 원본 보관, 파일 checksum/중복 처리, 파서 버전·청킹 파라미터 버전과 재파싱 정책을 추가한다. | 대용량 원본을 안전하게 복구·재처리하고 결과 재현 가능 |
-| P1 | job 실행 → 운영 | SQLite/thread fallback을 운영용 DB + Redis/SQS worker로 교체하고, worker-level 취소·재시도·멱등성·dead-letter 처리를 구현한다. | 다중 worker에서도 job 상태가 정확하고 장애 뒤 복구 가능 |
-| P2 | 후보 비교 → 개인화 | 반복 투표에서 상위 후보를 좁히고 청킹 파라미터를 미세 변주하는 적응형 탐색을 추가한다. | 불필요한 후보 수를 줄이면서도 탐색 근거와 되돌림이 보존됨 |
-| P2 | 제품 UX/QA | 실제 파일 fixture, 모델 미준비/지연/OCR 실패/대형 문서/다문서 검색 E2E와 접근성·반응형 회귀 테스트를 추가한다. | 주요 실패 경로가 사용자에게 이해 가능한 상태·복구 행동으로 노출됨 |
+완료 여부만 나열하지 않고, **앞 작업의 산출물이 다음 작업의 입력이 되는 순서**로 관리한다. `P0`는 다음 스프린트의 릴리스 조건이며, `P1`부터는 P0 결과가 확인된 뒤 착수한다.
 
-### 0.3 권장 다음 스프린트
+| Sprint | 상태 | 우선순위 | 플로우 | 남은 작업 | 선행 조건 | 종료 조건 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 06 | ✅ | P0 | 업로드 → 후보 준비 | 후보 준비/실패/근거 없음 상태와 복구 | 없음 | snapshot 복원, 선택 제한, 재시도 완료 |
+| 07 | 🟡 | P0 | 품질 검증 → 모델 선택 | 실제 corpus 10–20개와 golden Q/A·근거 라벨로 benchmark 확대 | 실제 모델 runtime | BGE/Qwen/Gemma 실측이 추천 근거로 조회됨 |
+| 08 | 🟡 | P0 | 대형 문서 업로드 → 비교 | 실제 대형 PDF/DOCX로 sample/full 재인덱싱 E2E | 실제 모델 runtime | 범위·비용·재인덱싱 상태가 실제 파일에서도 정확함 |
+| 09 | 🟡 | P1 | 비교·검색 → grounded 답변 | 실제 generator endpoint latency·취소·잘못된 citation fallback smoke | 실제 generator runtime | 제공 citation 밖의 모델 문장이 노출되지 않음 |
+| 10 | 🟡 | P1 | 여러 문서 → 답변 | 실제 다문서 corpus에서 정규화·rerank·종합 citation 품질 E2E | 07, 09 | 서로 다른 파이프라인의 근거가 하나의 답변에 보존됨 |
+| 11 | 다음 | **P0 release gate** | 모델 준비 → 릴리스 | 실제 모델 기동, provider smoke, 모델 미준비·지연·OCR/후보 실패·대형 문서·재방문 E2E | 06–10 | 필수 서비스 `READY`, happy/recovery path 자동 검증 |
+| 12 | 대기 | P1 | 피드백 → 재튜닝 | 피드백·benchmark 기반 임계값 보정, 전후 품질 비교, 추천 사유 UI | 07, 11 | 운영자가 재튜닝 효과를 비교 가능 |
+| 13 | 대기 | P1 | 문서 관리 → 재방문 | multipart/object storage, checksum·중복 처리, parser/chunk/model 버전, 재파싱 | 08, 11 | 원본 복구·재처리·재현 가능 |
+| 14 | 대기 | P1 | job 실행 → 운영 | 운영 DB + Redis/SQS worker, 취소·멱등성·재시도·dead-letter·관측성 | 06, 11 | 다중 worker·장애 복구에서도 상태 일관성 보장 |
+| 15 | 대기 | P2 | 후보 비교 → 개인화 | 상위 후보 축소, 청킹 파라미터 미세 탐색, 되돌림·설명 | 07, 12 | 탐색 비용을 줄이며 근거·되돌림 보존 |
 
-**“실제 모델 기반 품질 검증”**을 목표로 한다.
+### 0.3 재개용 권장 다음 스프린트 — Sprint 11 Release Gate
 
-1. BGE-M3와 reranker를 개발 서버에 실제 배포하고, OCR 필요 시 Tesseract를 함께 설치한다.
-2. 대표 문서 10~20개와 golden question/근거 쌍을 정의한다.
-3. benchmark harness로 BGE-M3·Qwen3·EmbeddingGemma의 recall@k·지연시간을 기록한다.
-4. 최고 후보를 선택한 뒤, 500 chunks 초과 문서의 샘플링·전체 재인덱싱 정책을 구현한다.
+다음 작업 지시는 **Sprint 11**부터 시작한다. 새로운 기능보다 실제 모델과 실제 파일로 Sprint 06–10의 계약을 릴리스 가능 상태로 검증하는 것이 우선이다.
+
+1. BGE-M3, reranker, generator, Tesseract를 기동하고 `model-runtime`·각 인스턴스 `execution-plan`의 필수 서비스가 모두 `READY`인지 확인한다.
+2. 대표 문서 10–20개와 golden 질문·정답 근거를 versioned fixture로 확정하고 benchmark를 다시 실행한다.
+3. 단일·대형·다문서·스캔 문서로 업로드 → 비교 → 확정 → 검색 E2E를 실행한다.
+4. 모델 미준비, endpoint timeout, OCR 실패, 잘못된 generator citation, 후보 부분 실패, 재시작 복원을 자동화한다.
+5. Sprint 11 release gate를 통과한 뒤 Sprint 12의 피드백 기반 재튜닝으로 진행한다.
+
+모델 endpoint가 없는 로컬 CI에서는 test double로 동일 계약을 검증한다. 구축된 개발 서버에서는 fallback 결과를 성공으로 간주하지 않는다. 모델 서버 구축 기준은 [`docs/MODEL_RUNTIME_DEPLOYMENT.md`](./docs/MODEL_RUNTIME_DEPLOYMENT.md)를 따른다.
+
+### 0.3a 완료된 초기 계획 — Retrieval Quality Foundation
+
+**스프린트 목표:** “실제 모델을 사용한 문서 업로드·비교 결과를 측정 가능하고 신뢰할 수 있게 만든다.”
+
+#### 작업 순서
+
+1. **후보 준비 상태와 복구 UX를 완성한다.**
+   - Backend: 후보별 state/error/attempt를 snapshot과 comparison API에 저장·반환한다.
+   - Frontend: `PREPARING`은 대기, `FAILED`는 실패 이유와 job 재시도, `NO_EVIDENCE`는 선택·확정 불가로 표시한다.
+   - QA: 새로고침, 취소, 부분 실패, 재시도 뒤 상태 전이를 자동 검증한다.
+2. **개발 서버 모델 런타임을 연결하고 end-to-end smoke test를 고정한다.**
+   - BGE-M3 embedding, reranker, Tesseract를 기동한다. API는 이미 모델이 존재한다는 전제의 endpoint를 사용하며, `execution-plan`이 단일 진실 공급원이다.
+   - 테스트 문서 하나를 업로드해 TEI embedding/rerank/OCR provider 메타데이터까지 확인한다.
+3. **golden set과 벤치마크 하네스를 만든다.**
+   - 먼저 corpus·질문·정답 근거를 versioned fixture로 고정한다.
+   - 그 다음 모델 3종의 recall@k/MRR/latency를 동일 조건에서 저장하고, 모델 추천 화면이 그 결과를 읽도록 연결한다.
+4. **대형 문서 비용 제어를 추가한다.**
+   - 500 chunks 초과 시 샘플 비교로 전환하고, 확정 후 전체 재인덱싱 job을 생성한다.
+   - 샘플 범위와 전체 인덱스 준비 여부를 비교·상세 화면에서 분명히 안내한다.
+5. **릴리스 QA를 수행한다.**
+   - 모델 미구축/지연, OCR 실패, 후보 일부 실패, 대형 문서, 재방문 복원까지 실제 API 기반 E2E로 확인한다.
+
+#### 이번 스프린트에서 하지 않는 일
+
+- 생성 모델을 붙여 답변을 유창하게 만드는 작업은 다음 스프린트(P1)로 둔다. 그 전에는 retrieval 품질과 근거 상태를 먼저 측정한다.
+- 다문서 종합 답변과 Redis/SQS 운영 전환도 이번 범위에서 제외한다. 둘 다 후보 상태 계약과 실제 모델 품질 결과가 안정된 뒤 설계해야 한다.
+
+#### 스프린트 완료 판정
+
+- 실제 모델 provider를 사용한 업로드→비교→확정→검색 smoke test가 성공한다.
+- 후보·job·비교 결과가 새로고침 뒤에도 같은 상태와 근거를 보여준다.
+- 최소 3개 임베딩 모델의 동일 corpus benchmark 결과가 저장되고 비교 가능하다.
+- P0 실패 시나리오가 자동화된 QA에서 재현·복구된다.
 
 모델 서버 구축의 책임·검증 기준은 [`docs/MODEL_RUNTIME_DEPLOYMENT.md`](./docs/MODEL_RUNTIME_DEPLOYMENT.md)를 따른다.
+
+### 0.4 스프린트 실행 기록
+
+| 스프린트 | 상태 | 목표 | 산출물 | 다음 입력 |
+| --- | --- | --- | --- | --- |
+| Sprint 06 | 완료 | 후보 준비·실패·근거 없음 상태를 실제 job/비교 흐름에 연결 | [`docs/SPRINT_06_CANDIDATE_READINESS.md`](./docs/SPRINT_06_CANDIDATE_READINESS.md), 상태 UX 검토, backend/frontend 회귀 테스트 | 실제 모델 runtime smoke test에서 상태 계약 사용 |
+| Sprint 07 | 완료 | golden corpus와 embedding benchmark harness | benchmark API·저장·모델별 비교 화면 | 실제 모델·대표 corpus release gate |
+| Sprint 08 | 완료 | 대형 문서 샘플 비교와 확정 뒤 전체 재인덱싱 | chunk 임계값 정책, sample/full job 상태, UI·회귀 테스트 | 실제 대형 파일 E2E |
+| Sprint 09 | 완료 | grounded generation·citation 검증·SSE | generator contract, fallback metadata, stream UI·회귀 테스트 | 다문서 retrieval 병합 |
+| Sprint 10 | 구현 완료 | 다문서 grounded 검색 | 전역 점수 병합, 다문서 citation, 종합 생성 UI | 실제 모델 smoke와 P1 QA |
+| Sprint 11 | 다음 | 실제 모델·실제 파일 release gate | runtime smoke, golden corpus 확대, 실패·복구 E2E | 피드백 기반 재튜닝 |
+| Sprint 12 | 대기 | 피드백 기반 재튜닝 | 임계값 보정, 품질 전후 비교, 추천 사유 | 원본 파일·운영 플랫폼 강화 |
+| Sprint 13 | 대기 | 원본 파일·재현성 | object storage, versioning, 재파싱 | 운영 worker 전환 |
+| Sprint 14 | 대기 | 운영 job 플랫폼 | DB/Redis/SQS, 멱등성, dead-letter, 관측성 | 적응형 개인화 |
+| Sprint 15 | 대기 | 적응형 후보 탐색 | 후보 축소, 파라미터 탐색, 되돌림 | 제품 고도화 backlog |
+
+Sprint 완료 시에는 항상 이 표, 해당 `docs/SPRINT_XX_*.md`, 자동 검증 기록을 함께 갱신한다. 모델 endpoint가 없는 로컬 CI에서는 network 호출을 mock/test double로 검증하고, 개발 서버에서는 같은 API 계약으로 smoke test를 별도 실행한다.
 
 ---
 
@@ -60,7 +116,7 @@ RAG를 처음 구축하는 **비전문가**가 (1) 파싱·청킹·임베딩·�
 | 2.2 | 문서별 실제 파싱·청킹·후보 분석 | ✅ 구현 | `apps/backend/app/document_parser.py`, `apps/backend/app/main.py` |
 | 2.3 | NotebookLM-inspired 제품 UI·가이드 | ✅ 구현 | `apps/frontend/src/features/rag/`, `skills/notebooklm-inspired-ui-skill/` |
 | 2.4 | 문서 타입별 청킹 후보 3개와 검색 페어링 | ✅ 구현 | 적응형 청킹 정책: `docs/SPRINT_05_ADAPTIVE_CHUNKING.md` |
-| 2.5 | 임베딩 모델 실측 벤치마크 하네스 | 🔴 미구현 (P0) | §0.2, 아래 §4 |
+| 2.5 | 임베딩 모델 실측 벤치마크 하네스 | 🟡 기반 구현, 실제 corpus/runtime E2E 대기 | Sprint 07, §0.2 |
 
 ---
 

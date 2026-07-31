@@ -1,9 +1,12 @@
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
+import { afterEach, vi } from 'vitest';
+import { ragApi } from '../shared/api/client';
 import { RagCreatePage } from './RagCreatePage';
 
 describe('RagCreatePage', () => {
+  afterEach(() => vi.restoreAllMocks());
   it('shows several model candidates and selects the recommendation from the answers', async () => {
     const user = userEvent.setup();
     render(
@@ -23,5 +26,49 @@ describe('RagCreatePage', () => {
 
     await user.click(screen.getByRole('radio', { name: /BGE-M3/ }));
     expect(screen.getByRole('radio', { name: /BGE-M3/ })).toBeChecked();
+  });
+
+  it('shows actual benchmark metrics only when the latest benchmark exists', async () => {
+    const user = userEvent.setup();
+    vi.spyOn(ragApi, 'recommendEmbeddingModels').mockResolvedValue([
+      {
+        id: 'BGE-M3',
+        label: '균형형 다국어 검색',
+        reason: '테스트 추천',
+        tradeoff: '테스트 확인 사항',
+        recommended: true,
+      },
+    ]);
+    vi.spyOn(ragApi, 'latestEmbeddingBenchmark').mockResolvedValue({
+      run: {
+        id: 'benchmark-1',
+        corpusLabel: '인사 규정 문서',
+        queryCount: 24,
+        createdAt: '2026-07-31',
+      },
+      results: [
+        {
+          modelId: 'BGE-M3',
+          recallAt1: 0.75,
+          recallAt5: 0.92,
+          mrr: 0.81,
+          averageLatencyMs: 42,
+          dimension: 1024,
+          provider: 'local',
+          status: 'READY',
+        },
+      ],
+    });
+    render(
+      <MemoryRouter>
+        <RagCreatePage />
+      </MemoryRouter>,
+    );
+
+    await user.click(screen.getByRole('button', { name: '후보 비교하기 →' }));
+    expect(await screen.findByRole('heading', { name: '우리 문서 실측 결과' })).toBeInTheDocument();
+    expect(screen.getByText(/인사 규정 문서 · 질문 24개/)).toBeInTheDocument();
+    expect(screen.getByText(/Recall@1 75.0% · Recall@5 92.0%/)).toBeInTheDocument();
+    expect(screen.getByText(/MRR 81.0% · 평균 42ms/)).toBeInTheDocument();
   });
 });

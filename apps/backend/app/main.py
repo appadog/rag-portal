@@ -28,12 +28,17 @@ from app.document_parser import extract_document
 from app.job_queue import backend_name, dispatch
 from app.model_runtime import execution_plan, runtime_catalog
 from app.retrieval import rank as rank_segments
+from app.retrieval import rerank as rerank_segments
 from app.retrieval import embed
+from app.generation import GenerationEndpointError, GenerationResult, generate_grounded
 
 
 API_PREFIX = "/api/v1"
 STATE_STORE = StateStore(os.getenv("RAG_PORTAL_DB_PATH", ".rag-portal.sqlite3"))
 STATE_LOCK = RLock()
+DEFAULT_COMPARISON_CHUNK_THRESHOLD = 500
+DEFAULT_MULTI_DOCUMENT_CONTEXT_LIMIT = 4
+DEFAULT_MULTI_DOCUMENT_RERANK_TOP_K = 8
 
 
 class InstanceStatus(StrEnum):
@@ -52,6 +57,15 @@ class JobState(StrEnum):
     CANCELLED = "CANCELLED"
 
 
+class CandidateState(StrEnum):
+    """Readiness of one retrieval candidate and its comparison result."""
+
+    PREPARING = "PREPARING"
+    READY = "READY"
+    FAILED = "FAILED"
+    NO_EVIDENCE = "NO_EVIDENCE"
+
+
 class Sensitivity(StrEnum):
     FLEXIBLE = "flexible"
     BALANCED = "balanced"
@@ -63,6 +77,18 @@ class PipelineMode(StrEnum):
 
     REUSE = "reuse"
     RETUNE = "retune"
+
+
+class ComparisonScope(StrEnum):
+    """Amount of a source indexed while a user is comparing candidates."""
+
+    FULL = "FULL"
+    SAMPLE = "SAMPLE"
+
+
+class JobKind(StrEnum):
+    PROCESSING = "PROCESSING"
+    FULL_REINDEX = "FULL_REINDEX"
 
 
 class ArtifactStatus(StrEnum):
@@ -157,6 +183,13 @@ class Document:
     parse_status: str = "PARSED"
     processing_job_id: str | None = None
     pipeline_mode: PipelineMode = PipelineMode.RETUNE
+    comparison_scope: ComparisonScope = ComparisonScope.FULL
+    comparison_chunk_threshold: int = DEFAULT_COMPARISON_CHUNK_THRESHOLD
+    estimated_chunk_count: int = 0
+    selected_chunk_count: int = 0
+    candidate_chunk_counts: dict[str, int] = field(default_factory=dict)
+    full_reindex_job_id: str | None = None
+    full_reindex_state: JobState | None = None
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     candidate_ids: list[str] = field(default_factory=list)
     finalized_candidate_id: str | None = None
@@ -180,6 +213,12 @@ class Candidate:
     embedding_warning: str | None = None
     chunking_parameters: dict = field(default_factory=dict)
     selection_reason: str = ""
+    preparation_state: CandidateState = CandidateState.PREPARING
+    preparation_error: str | None = None
+    prepared_at: datetime | None = None
+    estimated_chunk_count: int = 0
+    selected_chunk_count: int = 0
+    comparison_scope: ComparisonScope = ComparisonScope.FULL
 
 
 @dataclass(frozen=True)
@@ -208,6 +247,8 @@ class ProcessingJob:
     reuse_source_document_id: str | None = None
     cancel_requested: bool = False
     attempt: int = 1
+    kind: JobKind = JobKind.PROCESSING
+    comparison_plans: dict[str, dict] = field(default_factory=dict)
 
 
 @dataclass
@@ -219,6 +260,7 @@ class ComparisonRound:
     candidate_ids: list[str]
     created_at: datetime
     selected_candidate_ids: list[str] = field(default_factory=list)
+    candidate_states: dict[str, CandidateState] = field(default_factory=dict)
 
 
 @dataclass
@@ -254,6 +296,7 @@ JOBS: dict[str, ProcessingJob] = {}
 ROUNDS: dict[str, ComparisonRound] = {}
 FEEDBACK: list[dict] = []
 ARTIFACTS: dict[str, Artifact] = {}
+BENCHMARK_RUNS: list[dict] = []
 
 
 def encode_time(value: datetime | None) -> str | None:
@@ -300,6 +343,13 @@ def state_payload() -> dict:
                         "used_ocr": document.used_ocr,
                         "processing_job_id": document.processing_job_id,
                         "pipeline_mode": document.pipeline_mode,
+                        "comparison_scope": document.comparison_scope,
+                        "comparison_chunk_threshold": document.comparison_chunk_threshold,
+                        "estimated_chunk_count": document.estimated_chunk_count,
+                        "selected_chunk_count": document.selected_chunk_count,
+                        "candidate_chunk_counts": document.candidate_chunk_counts,
+                        "full_reindex_job_id": document.full_reindex_job_id,
+                        "full_reindex_state": document.full_reindex_state,
                         "created_at": encode_time(document.created_at),
                         "candidate_ids": document.candidate_ids,
                         "finalized_candidate_id": document.finalized_candidate_id,
@@ -336,6 +386,12 @@ def state_payload() -> dict:
                 "embedding_warning": candidate.embedding_warning,
                 "chunking_parameters": candidate.chunking_parameters,
                 "selection_reason": candidate.selection_reason,
+                "preparation_state": candidate.preparation_state,
+                "preparation_error": candidate.preparation_error,
+                "prepared_at": encode_time(candidate.prepared_at),
+                "estimated_chunk_count": candidate.estimated_chunk_count,
+                "selected_chunk_count": candidate.selected_chunk_count,
+                "comparison_scope": candidate.comparison_scope,
             }
             for candidate in CANDIDATES.values()
         ],
@@ -357,6 +413,8 @@ def state_payload() -> dict:
                 "reuse_source_document_id": job.reuse_source_document_id,
                 "cancel_requested": job.cancel_requested,
                 "attempt": job.attempt,
+                "kind": job.kind,
+                "comparison_plans": job.comparison_plans,
             }
             for job in JOBS.values()
         ],
@@ -369,6 +427,7 @@ def state_payload() -> dict:
                 "candidate_ids": round_.candidate_ids,
                 "created_at": encode_time(round_.created_at),
                 "selected_candidate_ids": round_.selected_candidate_ids,
+                "candidate_states": round_.candidate_states,
             }
             for round_ in ROUNDS.values()
         ],
@@ -388,6 +447,7 @@ def state_payload() -> dict:
             for artifact in ARTIFACTS.values()
         ],
         "feedback": FEEDBACK,
+        "benchmark_runs": BENCHMARK_RUNS,
     }
 
 
@@ -407,6 +467,7 @@ def restore_state() -> None:
         ROUNDS.clear()
         ARTIFACTS.clear()
         FEEDBACK.clear()
+        BENCHMARK_RUNS.clear()
         for item in payload.get("instances", []):
             instance = RagInstance(
                 id=item["id"],
@@ -433,6 +494,13 @@ def restore_state() -> None:
                     used_ocr=raw_document.get("used_ocr", False),
                     processing_job_id=raw_document.get("processing_job_id"),
                     pipeline_mode=PipelineMode(raw_document.get("pipeline_mode", PipelineMode.RETUNE)),
+                    comparison_scope=ComparisonScope(raw_document.get("comparison_scope", ComparisonScope.FULL)),
+                    comparison_chunk_threshold=raw_document.get("comparison_chunk_threshold", DEFAULT_COMPARISON_CHUNK_THRESHOLD),
+                    estimated_chunk_count=raw_document.get("estimated_chunk_count", 0),
+                    selected_chunk_count=raw_document.get("selected_chunk_count", 0),
+                    candidate_chunk_counts=raw_document.get("candidate_chunk_counts", {}),
+                    full_reindex_job_id=raw_document.get("full_reindex_job_id"),
+                    full_reindex_state=JobState(raw_document["full_reindex_state"]) if raw_document.get("full_reindex_state") else None,
                     created_at=decode_time(raw_document.get("created_at")) or datetime.now(UTC),
                     candidate_ids=raw_document.get("candidate_ids", []),
                     finalized_candidate_id=raw_document.get("finalized_candidate_id"),
@@ -440,11 +508,15 @@ def restore_state() -> None:
                 instance.documents[document.id] = document
             INSTANCES[instance.id] = instance
         for item in payload.get("candidates", []):
+            legacy_state = CandidateState.READY if item.get("vectors") else CandidateState.PREPARING
             CANDIDATES[item["id"]] = Candidate(
                 **{
                     **item,
                     "segments": [Segment(**segment) for segment in item.get("segments", [])],
                     "vectors": item.get("vectors", {}),
+                    "preparation_state": CandidateState(item.get("preparation_state", legacy_state)),
+                    "prepared_at": decode_time(item.get("prepared_at")),
+                    "comparison_scope": ComparisonScope(item.get("comparison_scope", ComparisonScope.FULL)),
                 }
             )
         documents_by_id = {
@@ -475,6 +547,8 @@ def restore_state() -> None:
                 reuse_source_document_id=item.get("reuse_source_document_id"),
                 cancel_requested=item.get("cancel_requested", False),
                 attempt=item.get("attempt", 1),
+                kind=JobKind(item.get("kind", JobKind.PROCESSING)),
+                comparison_plans=item.get("comparison_plans", {}),
             )
         for item in payload.get("rounds", []):
             ROUNDS[item["id"]] = ComparisonRound(
@@ -485,6 +559,10 @@ def restore_state() -> None:
                 candidate_ids=item.get("candidate_ids", []),
                 created_at=decode_time(item.get("created_at")) or datetime.now(UTC),
                 selected_candidate_ids=item.get("selected_candidate_ids", []),
+                candidate_states={
+                    candidate_id: CandidateState(state)
+                    for candidate_id, state in item.get("candidate_states", {}).items()
+                },
             )
         for item in payload.get("artifacts", []):
             ARTIFACTS[item["id"]] = Artifact(
@@ -500,6 +578,7 @@ def restore_state() -> None:
                 updated_at=decode_time(item.get("updated_at")) or datetime.now(UTC),
             )
         FEEDBACK.extend(payload.get("feedback", []))
+        BENCHMARK_RUNS.extend(payload.get("benchmark_runs", []))
 
 
 def now() -> str:
@@ -809,9 +888,67 @@ def candidate_blueprints(document: Document) -> list[tuple[ChunkingOption, str, 
     ]
 
 
+def comparison_chunk_threshold() -> int:
+    """Read the per-candidate comparison budget without hard-coding policy."""
+    try:
+        return max(1, int(os.getenv("RAG_PORTAL_COMPARISON_CHUNK_THRESHOLD", str(DEFAULT_COMPARISON_CHUNK_THRESHOLD))))
+    except ValueError:
+        return DEFAULT_COMPARISON_CHUNK_THRESHOLD
+
+
+def evenly_sample_segments(segments: list[Segment], limit: int) -> list[Segment]:
+    """Keep sample comparison bounded while covering the entire source span."""
+    if len(segments) <= limit:
+        return segments
+    if limit == 1:
+        return [segments[0]]
+    indexes = {
+        round(index * (len(segments) - 1) / (limit - 1))
+        for index in range(limit)
+    }
+    return [segment for index, segment in enumerate(segments) if index in indexes]
+
+
+def configure_comparison_scope(document: Document) -> None:
+    """Persist the full-size estimate and the bounded tuning input for a source.
+
+    The threshold is evaluated per chunking strategy. Retrieval variants do not
+    change embedding cost, so they share their strategy's selected chunks.
+    """
+    threshold = comparison_chunk_threshold()
+    options = adaptive_chunking_options(document)
+    counts = {
+        option.strategy: len(chunks_for_strategy(document, option.strategy, option.parameters))
+        for option in options
+    }
+    estimated = max(counts.values(), default=0)
+    document.comparison_chunk_threshold = threshold
+    document.candidate_chunk_counts = counts
+    document.estimated_chunk_count = estimated
+    document.comparison_scope = (
+        ComparisonScope.SAMPLE
+        if document.pipeline_mode == PipelineMode.RETUNE and estimated > threshold
+        else ComparisonScope.FULL
+    )
+    document.selected_chunk_count = min(estimated, threshold) if document.comparison_scope == ComparisonScope.SAMPLE else estimated
+
+
+def candidate_comparison_segments(document: Document, option: ChunkingOption) -> tuple[list[Segment], int]:
+    full_segments = chunks_for_strategy(document, option.strategy, option.parameters)
+    selected = (
+        evenly_sample_segments(full_segments, document.comparison_chunk_threshold)
+        if document.comparison_scope == ComparisonScope.SAMPLE
+        else full_segments
+    )
+    return selected, len(full_segments)
+
+
 def create_candidates(instance: RagInstance, document: Document) -> list[Candidate]:
+    if not document.candidate_chunk_counts:
+        configure_comparison_scope(document)
     candidates = []
     for chunker, retrieval_label, retrieval_key in candidate_blueprints(document):
+        segments, estimated_chunk_count = candidate_comparison_segments(document, chunker)
         candidate = Candidate(
             id=new_id(),
             document_id=document.id,
@@ -821,7 +958,10 @@ def create_candidates(instance: RagInstance, document: Document) -> list[Candida
             technical_description=f"{chunker.reason} · {chunker.strategy} + {retrieval_key}",
             chunking_parameters=chunker.parameters,
             selection_reason=chunker.reason,
-            segments=chunks_for_strategy(document, chunker.strategy, chunker.parameters),
+            segments=segments,
+            estimated_chunk_count=estimated_chunk_count,
+            selected_chunk_count=len(segments),
+            comparison_scope=document.comparison_scope,
         )
         CANDIDATES[candidate.id] = candidate
         candidates.append(candidate)
@@ -988,6 +1128,126 @@ def citation_payload(document: Document, segment: Segment, number: int) -> dict:
     }
 
 
+class GroundingValidationError(ValueError):
+    """A generator response did not cite every sentence with supplied context."""
+
+
+def extractive_sentence(segment: Segment) -> str:
+    sentence = segment.text.split(". ")[0].strip()
+    if not sentence.endswith((".", "다.", "요.")):
+        sentence += "."
+    return sentence
+
+
+def bounded_positive_env(name: str, default: int) -> int:
+    """Read a bounded retrieval knob without letting invalid env values break search."""
+    try:
+        return max(1, int(os.getenv(name, str(default))))
+    except ValueError:
+        return default
+
+
+def multi_document_context_limit() -> int:
+    return bounded_positive_env("RAG_MULTI_DOCUMENT_CONTEXT_LIMIT", DEFAULT_MULTI_DOCUMENT_CONTEXT_LIMIT)
+
+
+def multi_document_rerank_top_k() -> int:
+    return bounded_positive_env("RAG_MULTI_DOCUMENT_RERANK_TOP_K", DEFAULT_MULTI_DOCUMENT_RERANK_TOP_K)
+
+
+def render_validated_generation(
+    generated: GenerationResult,
+    citations_by_segment_id: dict[str, dict],
+) -> tuple[str, list[dict], list[list[str]]]:
+    """Render model text only after every sentence has valid source IDs."""
+    supplied_ids = set(citations_by_segment_id)
+    used_ids: list[str] = []
+    sentences: list[str] = []
+    sentence_citation_ids: list[list[str]] = []
+    for generated_sentence in generated.sentences:
+        text = generated_sentence.text.strip()
+        citation_ids = generated_sentence.citation_ids
+        if not text or not citation_ids:
+            raise GroundingValidationError("every generated sentence requires at least one citation")
+        if any(citation_id not in supplied_ids for citation_id in citation_ids):
+            raise GroundingValidationError("generated citation does not reference supplied segment IDs")
+        unique_sentence_ids = list(dict.fromkeys(citation_ids))
+        for citation_id in unique_sentence_ids:
+            if citation_id not in used_ids:
+                used_ids.append(citation_id)
+        sentence_citation_ids.append(unique_sentence_ids)
+        sentences.append(text)
+    citations = [{**citations_by_segment_id[citation_id], "number": index} for index, citation_id in enumerate(used_ids, start=1)]
+    citation_numbers = {citation["segment_id"]: citation["number"] for citation in citations}
+    answer = " ".join(
+        f"{sentence} {' '.join(f'[{citation_numbers[citation_id]}]' for citation_id in citation_ids)}"
+        for sentence, citation_ids in zip(sentences, sentence_citation_ids)
+    )
+    return answer, citations, sentence_citation_ids
+
+
+def grounded_generation_for(question: str, document: Document, segment: Segment) -> tuple[str, list[dict], dict]:
+    return grounded_generation_for_contexts(question, [(document, segment)])
+
+
+def grounded_generation_for_contexts(
+    question: str,
+    contexts: list[tuple[Document, Segment]],
+) -> tuple[str, list[dict], dict]:
+    """Generate only from a bounded set of retrieved cross-document contexts."""
+    citations_by_segment_id = {
+        segment.id: citation_payload(document, segment, index)
+        for index, (document, segment) in enumerate(contexts, start=1)
+    }
+    supplied_segment_ids = list(citations_by_segment_id)
+    try:
+        generated = generate_grounded(
+            question=question,
+            contexts=[{"segment_id": segment.id, "text": segment.text} for _, segment in contexts],
+        )
+        answer, citations, sentence_citation_ids = render_validated_generation(generated, citations_by_segment_id)
+        return answer, citations, {
+            "mode": "MODEL",
+            "provider": generated.provider,
+            "model": generated.model,
+            "latency_ms": generated.latency_ms,
+            "fallback": False,
+            "fallback_reason": None,
+            "grounding_valid": True,
+            "supplied_segment_ids": supplied_segment_ids,
+            "sentence_citation_ids": sentence_citation_ids,
+        }
+    except GroundingValidationError as error:
+        fallback_reason = "INVALID_GROUNDING"
+        failure = str(error)
+    except GenerationEndpointError as error:
+        fallback_reason = "GENERATOR_UNAVAILABLE"
+        failure = str(error)
+    # The fallback stays within the same bounded evidence set and still exposes
+    # source IDs per sentence, so a bad model response cannot leak ungrounded text.
+    fallback_contexts = contexts[: min(2, len(contexts))]
+    fallback_citations = [
+        {**citations_by_segment_id[segment.id], "number": index}
+        for index, (_, segment) in enumerate(fallback_contexts, start=1)
+    ]
+    fallback_answer = " ".join(
+        f"{extractive_sentence(segment)} [{index}]"
+        for index, (_, segment) in enumerate(fallback_contexts, start=1)
+    )
+    return fallback_answer, fallback_citations, {
+        "mode": "EXTRACTIVE_FALLBACK",
+        "provider": "extractive-fallback",
+        "model": None,
+        "latency_ms": 0,
+        "fallback": True,
+        "fallback_reason": fallback_reason,
+        "failure": failure,
+        "grounding_valid": True,
+        "supplied_segment_ids": supplied_segment_ids,
+        "sentence_citation_ids": [[segment.id] for _, segment in fallback_contexts],
+    }
+
+
 def answer_for(
     document: Document,
     question: str,
@@ -1012,16 +1272,216 @@ def answer_for(
             "relevance": round(relevance, 3),
             "grounded": False,
             "retrieval_metadata": retrieval_metadata,
+            "generation": {
+                "mode": "NOT_ATTEMPTED",
+                "provider": None,
+                "fallback": False,
+                "fallback_reason": "NO_RETRIEVED_EVIDENCE",
+                "grounding_valid": True,
+                "supplied_segment_ids": [],
+                "sentence_citation_ids": [],
+            },
         }
-    sentence = segment.text.split(". ")[0].strip()
-    if not sentence.endswith((".", "다.", "요.")):
-        sentence += "."
+    answer, citations, generation = grounded_generation_for(question, document, segment)
     return {
-        "answer": f"{sentence} [1]",
-        "citations": [citation_payload(document, segment, 1)],
+        "answer": answer,
+        "citations": citations,
         "relevance": round(relevance, 3),
         "grounded": True,
         "retrieval_metadata": retrieval_metadata,
+        "generation": generation,
+    }
+
+
+def grouped_citations(citations: list[dict], documents: list[Document]) -> list[dict]:
+    """Keep the flat citation contract while making cross-document provenance explicit."""
+    document_order = {document.id: index for index, document in enumerate(documents)}
+    groups: dict[str, dict] = {}
+    for citation in citations:
+        group = groups.setdefault(
+            citation["document_id"],
+            {
+                "document_id": citation["document_id"],
+                "filename": citation["filename"],
+                "citations": [],
+            },
+        )
+        group["citations"].append(citation)
+    return sorted(groups.values(), key=lambda group: document_order.get(group["document_id"], len(document_order)))
+
+
+def retrieve_document_candidates(
+    document: Document,
+    candidate: Candidate,
+    question: str,
+    embedding_model: str,
+    retrieval_override: str | None,
+) -> tuple[list[dict], dict]:
+    """Retrieve within one finalized document before any cross-document merge."""
+    retrieval_config = retrieval_override or candidate.retrieval_config
+    segments = candidate.segments
+    ranking_metadata: dict
+    if candidate.vectors and all(segment.id in candidate.vectors for segment in segments):
+        # Existing rank() reranks the full list. Multi-document search first
+        # narrows by hybrid retrieval and reranks only this document's top-k.
+        base_config = "hybrid" if retrieval_config == "hybrid_rerank" else retrieval_config
+        scores, query_batch, ranking_metadata = rank_segments(
+            query=question,
+            texts=[segment.text for segment in segments],
+            vectors=[candidate.vectors[segment.id] for segment in segments],
+            retrieval_config=base_config,
+            model_name=embedding_model,
+        )
+        ranking_metadata = {
+            "provider": query_batch.provider,
+            "dimension": query_batch.dimension,
+            "warning": query_batch.warning,
+            **ranking_metadata,
+        }
+    else:
+        scores = [score(question, segment, retrieval_config) for segment in segments]
+        ranking_metadata = {"provider": "legacy-lexical", "dimension": None, "warning": None}
+
+    rerank_metadata = {
+        "configured": retrieval_config == "hybrid_rerank",
+        "applied": False,
+        "top_k": 0,
+        "provider": None,
+        "warning": None,
+    }
+    if retrieval_config == "hybrid_rerank" and scores:
+        top_k = min(multi_document_rerank_top_k(), len(scores))
+        top_indices = sorted(range(len(scores)), key=scores.__getitem__, reverse=True)[:top_k]
+        rerank_scores, provider, warning = rerank_segments(question, [segments[index].text for index in top_indices])
+        for index, rerank_score in zip(top_indices, rerank_scores):
+            scores[index] = 0.7 * scores[index] + 0.3 * rerank_score
+        rerank_metadata = {
+            "configured": True,
+            "applied": True,
+            "top_k": top_k,
+            "provider": provider,
+            "warning": warning,
+        }
+
+    maximum = max(scores, default=0.0)
+    ordered = sorted(range(len(scores)), key=scores.__getitem__, reverse=True)
+    entries = [
+        {
+            "document": document,
+            "candidate": candidate,
+            "segment": segments[index],
+            "raw_score": scores[index],
+            "normalized_score": scores[index] / maximum if maximum else 0.0,
+            "document_rank": rank + 1,
+        }
+        for rank, index in enumerate(ordered)
+    ]
+    metadata = {
+        "document_id": document.id,
+        "filename": document.filename,
+        "candidate_id": candidate.id,
+        "retrieval_config": retrieval_config,
+        "retrieval_config_source": "request_override" if retrieval_override else "document_finalized",
+        "candidate_chunk_count": len(segments),
+        "retrieved_count": len(entries),
+        "score_normalization": {"method": "per_document_max", "maximum_raw_score": round(maximum, 6)},
+        "rerank": rerank_metadata,
+        "ranking": ranking_metadata,
+        "top_candidates": [
+            {
+                "segment_id": entry["segment"].id,
+                "raw_score": round(entry["raw_score"], 6),
+                "normalized_score": round(entry["normalized_score"], 6),
+                "document_rank": entry["document_rank"],
+            }
+            for entry in entries[: min(5, len(entries))]
+        ],
+    }
+    return entries, metadata
+
+
+def answer_for_documents(
+    documents: list[Document],
+    question: str,
+    sensitivity: Sensitivity,
+    embedding_model: str,
+    retrieval_override: str | None,
+) -> dict:
+    """Merge independently tuned sources into one bounded grounded answer."""
+    per_document_entries: list[dict] = []
+    document_metadata: list[dict] = []
+    for document in documents:
+        candidate = CANDIDATES[document.finalized_candidate_id]
+        entries, metadata = retrieve_document_candidates(
+            document, candidate, question, embedding_model, retrieval_override
+        )
+        per_document_entries.extend(entries)
+        document_metadata.append(metadata)
+
+    document_order = {document.id: index for index, document in enumerate(documents)}
+    merged = sorted(
+        per_document_entries,
+        key=lambda entry: (
+            -entry["normalized_score"],
+            document_order[entry["document"].id],
+            entry["document_rank"],
+        ),
+    )
+    context_limit = multi_document_context_limit()
+    selected = [entry for entry in merged if entry["normalized_score"] > 0][:context_limit]
+    thresholds = {Sensitivity.FLEXIBLE: 0.05, Sensitivity.BALANCED: 0.12, Sensitivity.STRICT: 0.24}
+    relevance = selected[0]["normalized_score"] if selected else 0.0
+    retrieval_metadata = {
+        "mode": "MULTI_DOCUMENT",
+        "merge": {
+            "strategy": "per_document_max_normalized_global_merge",
+            "context_limit": context_limit,
+            "selected_context_count": len(selected),
+            "threshold": thresholds[sensitivity],
+        },
+        "documents": document_metadata,
+        "global_candidates": [
+            {
+                "document_id": entry["document"].id,
+                "filename": entry["document"].filename,
+                "segment_id": entry["segment"].id,
+                "raw_score": round(entry["raw_score"], 6),
+                "normalized_score": round(entry["normalized_score"], 6),
+                "document_rank": entry["document_rank"],
+            }
+            for entry in merged[: min(20, len(merged))]
+        ],
+    }
+    if not selected or relevance < thresholds[sensitivity]:
+        return {
+            "answer": "관련 문서를 찾지 못했습니다. 검색 범위나 질문을 조금 더 구체적으로 바꿔보세요.",
+            "citations": [],
+            "grouped_citations": [],
+            "relevance": round(relevance, 3),
+            "grounded": False,
+            "retrieval_metadata": retrieval_metadata,
+            "generation": {
+                "mode": "NOT_ATTEMPTED",
+                "provider": None,
+                "fallback": False,
+                "fallback_reason": "NO_RETRIEVED_EVIDENCE",
+                "grounding_valid": True,
+                "supplied_segment_ids": [],
+                "sentence_citation_ids": [],
+            },
+        }
+    answer, citations, generation = grounded_generation_for_contexts(
+        question,
+        [(entry["document"], entry["segment"]) for entry in selected],
+    )
+    return {
+        "answer": answer,
+        "citations": citations,
+        "grouped_citations": grouped_citations(citations, documents),
+        "relevance": round(relevance, 3),
+        "grounded": True,
+        "retrieval_metadata": retrieval_metadata,
+        "generation": generation,
     }
 
 
@@ -1039,6 +1499,17 @@ def candidate_payload(candidate: Candidate) -> dict:
         "selection_count": candidate.selection_count,
         "finalized": candidate.finalized,
         "chunk_count": len(candidate.segments),
+        "comparison": {
+            "scope": candidate.comparison_scope,
+            "estimated_chunk_count": candidate.estimated_chunk_count,
+            "selected_chunk_count": candidate.selected_chunk_count,
+        },
+        "preparation": {
+            "state": candidate.preparation_state,
+            "ready": candidate.preparation_state == CandidateState.READY,
+            "error": candidate.preparation_error,
+            "prepared_at": encode_time(candidate.prepared_at),
+        },
         "index": {
             "vector_count": len(candidate.vectors),
             "embedding_provider": candidate.embedding_provider,
@@ -1081,10 +1552,28 @@ def document_payload(document: Document) -> dict:
         "used_ocr": document.used_ocr,
         "processing_job_id": document.processing_job_id,
         "pipeline_mode": document.pipeline_mode,
+        "comparison": comparison_plan_payload(document),
+        "full_reindex": {
+            "required": document.comparison_scope == ComparisonScope.SAMPLE,
+            "job_id": document.full_reindex_job_id,
+            "state": document.full_reindex_state,
+            "ready": document.full_reindex_state in {None, JobState.SUCCEEDED},
+        },
         "segment_count": len(document.segments),
         "finalized_candidate_id": document.finalized_candidate_id,
         "created_at": document.created_at.isoformat(),
         "candidates": [candidate_payload(CANDIDATES[candidate_id]) for candidate_id in document.candidate_ids],
+    }
+
+
+def comparison_plan_payload(document: Document) -> dict:
+    return {
+        "scope": document.comparison_scope,
+        "chunk_threshold": document.comparison_chunk_threshold,
+        "estimated_chunk_count": document.estimated_chunk_count,
+        "selected_chunk_count": document.selected_chunk_count,
+        "candidate_chunk_counts": document.candidate_chunk_counts,
+        "full_source_retained": True,
     }
 
 
@@ -1115,6 +1604,81 @@ def get_model_runtime() -> dict:
         "catalog_ready": all(service["ready"] for service in services),
         "production_policy": "인스턴스별 execution plan의 모든 필수 모델 서비스가 READY여야 문서 처리와 검색을 시작합니다.",
     }
+
+
+@app.get(f"{API_PREFIX}/large-document-policy")
+def get_large_document_policy() -> dict:
+    return {
+        "comparison_chunk_threshold": comparison_chunk_threshold(),
+        "default_comparison_chunk_threshold": DEFAULT_COMPARISON_CHUNK_THRESHOLD,
+        "scope_rule": "각 청킹 전략의 예상 청크 수가 임계값을 초과하면 SAMPLE 비교를 사용하고, 확정 뒤 FULL_REINDEX job을 생성합니다.",
+        "sample_selection": "문서 첫·중간·끝 범위를 고르게 포함하는 결정론적 간격 샘플",
+    }
+
+
+BENCHMARK_CORPUS = [
+    "국내 출장 숙박비는 1박 10만원을 한도로 합니다.",
+    "해외 출장 식비는 국가 등급에 따라 하루 80달러에서 150달러입니다.",
+    "연차 휴가는 사전에 승인받아야 합니다.",
+]
+BENCHMARK_QUERIES = [
+    ("국내 출장 숙박비 한도는?", 0),
+    ("해외 출장 식비는 얼마인가요?", 1),
+    ("연차 휴가 신청 절차는?", 2),
+]
+
+
+def run_embedding_benchmark() -> dict:
+    """Run a small versioned golden set through the same embedding contract as retrieval."""
+    results = []
+    for model_id in ("BGE-M3", "Qwen3-Embedding-0.6B", "EmbeddingGemma-300M"):
+        try:
+            corpus_batch = embed(BENCHMARK_CORPUS, model_id)
+            ranks = []
+            latencies = [corpus_batch.latency_ms]
+            for question, expected_index in BENCHMARK_QUERIES:
+                scores, query_batch, _ = rank_segments(
+                    query=question,
+                    texts=BENCHMARK_CORPUS,
+                    vectors=corpus_batch.vectors,
+                    retrieval_config="dense",
+                    model_name=model_id,
+                )
+                ordered = sorted(range(len(scores)), key=scores.__getitem__, reverse=True)
+                ranks.append(ordered.index(expected_index) + 1)
+                latencies.append(query_batch.latency_ms)
+            provider = corpus_batch.provider
+            results.append(
+                {
+                    "model_id": model_id,
+                    "recall_at_1": round(sum(rank == 1 for rank in ranks) / len(ranks), 3),
+                    "recall_at_5": round(sum(rank <= 5 for rank in ranks) / len(ranks), 3),
+                    "mrr": round(sum(1 / rank for rank in ranks) / len(ranks), 3),
+                    "average_latency_ms": round(sum(latencies) / len(latencies)),
+                    "dimension": corpus_batch.dimension,
+                    "provider": provider,
+                    "status": "FALLBACK" if "fallback" in provider else "COMPLETED",
+                }
+            )
+        except Exception as error:
+            results.append({"model_id": model_id, "recall_at_1": None, "recall_at_5": None, "mrr": None, "average_latency_ms": None, "dimension": None, "provider": "unavailable", "status": "FAILED", "error": str(error)})
+    run = {"id": new_id(), "corpus_label": "Sprint 07 golden corpus v1", "query_count": len(BENCHMARK_QUERIES), "created_at": now()}
+    benchmark = {"run": run, "results": results}
+    BENCHMARK_RUNS.append(benchmark)
+    persist_state()
+    return benchmark
+
+
+@app.post(f"{API_PREFIX}/embedding-benchmarks/run")
+def create_embedding_benchmark() -> dict:
+    return run_embedding_benchmark()
+
+
+@app.get(f"{API_PREFIX}/embedding-benchmarks/latest")
+def get_latest_embedding_benchmark() -> dict:
+    if not BENCHMARK_RUNS:
+        raise HTTPException(404, detail={"code": "BENCHMARK_NOT_RUN", "message": "아직 우리 문서 실측 결과를 실행하지 않았습니다."})
+    return BENCHMARK_RUNS[-1]
 
 
 @app.get(f"{API_PREFIX}/rag-instances")
@@ -1194,6 +1758,13 @@ def job_stages(mode: PipelineMode) -> list[dict]:
     ]
 
 
+def full_reindex_stages() -> list[dict]:
+    return [
+        {"key": "FULL_CHUNKING", "label": "확정된 설정으로 전체 문서를 다시 나누는 중", "state": "QUEUED", "completed_at": None},
+        {"key": "FULL_INDEXING", "label": "전체 문서 검색 인덱스를 만드는 중", "state": "QUEUED", "completed_at": None},
+    ]
+
+
 def complete_stage(job: ProcessingJob, key: str, state: JobState, current_step: str, completed: int) -> None:
     job.state = state
     job.current_step = current_step
@@ -1212,6 +1783,22 @@ class JobCancelled(Exception):
 def ensure_job_is_active(job: ProcessingJob) -> None:
     if job.cancel_requested:
         raise JobCancelled()
+
+
+def fail_preparing_candidates(job: ProcessingJob, message: str) -> None:
+    instance = INSTANCES.get(job.instance_id)
+    if not instance:
+        return
+    for document_id in job.document_ids:
+        document = instance.documents.get(document_id)
+        if not document:
+            continue
+        for candidate_id in document.candidate_ids:
+            candidate = CANDIDATES.get(candidate_id)
+            if candidate and candidate.preparation_state == CandidateState.PREPARING:
+                candidate.preparation_state = CandidateState.FAILED
+                candidate.preparation_error = message
+                candidate.prepared_at = datetime.now(UTC)
 
 
 def run_processing_job(job_id: str, mode: PipelineMode, reuse_source_document_id: str | None = None) -> None:
@@ -1245,7 +1832,15 @@ def run_processing_job(job_id: str, mode: PipelineMode, reuse_source_document_id
                 document.segments = split_segments(parsed.text)
                 document.chunking_analysis = analyze_document_for_chunking(document)
                 document.profile = document_profile(document, document.chunking_analysis)
+                configure_comparison_scope(document)
                 document.parse_status = "PARSED"
+            job.comparison_plans = {
+                document_id: comparison_plan_payload(instance.documents[document_id])
+                for document_id in job.document_ids
+            }
+            artifact = ARTIFACTS.get(job.artifact_id) if job.artifact_id else None
+            if artifact:
+                artifact.metadata["comparison_plans"] = job.comparison_plans
             complete_stage(job, "PARSING", JobState.GENERATING_CANDIDATES, "비교 후보를 준비하고 있어요.", 1)
             persist_state()
 
@@ -1273,6 +1868,9 @@ def run_processing_job(job_id: str, mode: PipelineMode, reuse_source_document_id
                         chunking_parameters=source.chunking_parameters,
                         selection_reason=f"확정 파이프라인을 재사용했습니다. 원래 선택 근거: {source.selection_reason}",
                         segments=chunks_for_strategy(document, source.chunking_strategy, source.chunking_parameters),
+                        estimated_chunk_count=document.candidate_chunk_counts.get(source.chunking_strategy, 0),
+                        selected_chunk_count=document.candidate_chunk_counts.get(source.chunking_strategy, 0),
+                        comparison_scope=ComparisonScope.FULL,
                     )
                     CANDIDATES[reused.id] = reused
                     document.candidate_ids.append(reused.id)
@@ -1287,10 +1885,27 @@ def run_processing_job(job_id: str, mode: PipelineMode, reuse_source_document_id
             job = JOBS[job_id]
             ensure_job_is_active(job)
             instance = get_instance(job.instance_id)
+            ready_candidates = 0
             for document_id in job.document_ids:
                 document = instance.documents[document_id]
                 for candidate_id in document.candidate_ids:
-                    prepare_candidate_index(instance, CANDIDATES[candidate_id])
+                    candidate = CANDIDATES[candidate_id]
+                    candidate.preparation_state = CandidateState.PREPARING
+                    candidate.preparation_error = None
+                    candidate.prepared_at = None
+                    try:
+                        prepare_candidate_index(instance, candidate)
+                    except Exception as error:
+                        candidate.preparation_state = CandidateState.FAILED
+                        candidate.preparation_error = str(error)
+                        candidate.prepared_at = datetime.now(UTC)
+                    else:
+                        candidate.preparation_state = CandidateState.READY
+                        candidate.prepared_at = datetime.now(UTC)
+                        ready_candidates += 1
+                    persist_state()
+            if not ready_candidates:
+                raise RuntimeError("검색 후보를 하나도 준비하지 못했습니다.")
             complete_stage(job, "INDEXING", JobState.SUCCEEDED, "검색 준비가 완료되었어요.", 3)
             job.completed_at = datetime.now(UTC)
             instance.status = (
@@ -1303,6 +1918,7 @@ def run_processing_job(job_id: str, mode: PipelineMode, reuse_source_document_id
                 artifact.status = ArtifactStatus.READY
                 artifact.updated_at = datetime.now(UTC)
                 artifact.metadata["summary"] = "문서 파싱과 검색 준비가 완료되었습니다."
+                artifact.metadata["comparison_plans"] = job.comparison_plans
             persist_state()
     except JobCancelled:
         with STATE_LOCK:
@@ -1311,6 +1927,7 @@ def run_processing_job(job_id: str, mode: PipelineMode, reuse_source_document_id
                 job.state = JobState.CANCELLED
                 job.current_step = "문서 준비를 중단했어요."
                 job.completed_at = datetime.now(UTC)
+                fail_preparing_candidates(job, "문서 준비가 중단되었습니다.")
                 artifact = ARTIFACTS.get(job.artifact_id) if job.artifact_id else None
                 if artifact:
                     artifact.status = ArtifactStatus.FAILED
@@ -1325,10 +1942,104 @@ def run_processing_job(job_id: str, mode: PipelineMode, reuse_source_document_id
                 job.current_step = "문서 준비를 마치지 못했어요."
                 job.error_message = str(error)
                 job.completed_at = datetime.now(UTC)
+                fail_preparing_candidates(job, "문서 준비 중 오류가 발생했습니다.")
                 artifact = ARTIFACTS.get(job.artifact_id) if job.artifact_id else None
                 if artifact:
                     artifact.status = ArtifactStatus.FAILED
                     artifact.updated_at = datetime.now(UTC)
+                persist_state()
+
+
+def run_full_reindex_job(job_id: str) -> None:
+    """Build the production-sized index after a sampled comparison is chosen."""
+    try:
+        with STATE_LOCK:
+            job = JOBS[job_id]
+            ensure_job_is_active(job)
+            instance = get_instance(job.instance_id)
+            job.state = JobState.GENERATING_CANDIDATES
+            job.current_step = "확정된 설정으로 전체 문서를 다시 나누고 있어요."
+            for document_id in job.document_ids:
+                document = instance.documents[document_id]
+                document.full_reindex_state = JobState.GENERATING_CANDIDATES
+            persist_state()
+
+        with STATE_LOCK:
+            job = JOBS[job_id]
+            ensure_job_is_active(job)
+            instance = get_instance(job.instance_id)
+            for document_id in job.document_ids:
+                document = instance.documents[document_id]
+                if not document.finalized_candidate_id:
+                    raise ValueError("확정된 파이프라인이 없는 문서는 전체 재인덱싱할 수 없습니다.")
+                candidate = CANDIDATES[document.finalized_candidate_id]
+                full_segments = chunks_for_strategy(document, candidate.chunking_strategy, candidate.chunking_parameters)
+                candidate.segments = full_segments
+                candidate.preparation_state = CandidateState.PREPARING
+                candidate.preparation_error = None
+                candidate.prepared_at = None
+            complete_stage(job, "FULL_CHUNKING", JobState.INDEXING, "전체 문서 검색 인덱스를 만들고 있어요.", 1)
+            persist_state()
+
+        with STATE_LOCK:
+            job = JOBS[job_id]
+            ensure_job_is_active(job)
+            instance = get_instance(job.instance_id)
+            for document_id in job.document_ids:
+                document = instance.documents[document_id]
+                candidate = CANDIDATES[document.finalized_candidate_id]
+                prepare_candidate_index(instance, candidate)
+                candidate.preparation_state = CandidateState.READY
+                candidate.prepared_at = datetime.now(UTC)
+                document.full_reindex_state = JobState.SUCCEEDED
+            complete_stage(job, "FULL_INDEXING", JobState.SUCCEEDED, "전체 문서 재인덱싱이 완료되었어요.", 2)
+            job.completed_at = datetime.now(UTC)
+            artifact = ARTIFACTS.get(job.artifact_id) if job.artifact_id else None
+            if artifact:
+                artifact.status = ArtifactStatus.READY
+                artifact.updated_at = datetime.now(UTC)
+                artifact.metadata["summary"] = "확정된 설정으로 전체 문서 재인덱싱을 완료했습니다."
+                artifact.metadata["indexed_chunk_counts"] = {
+                    document_id: len(CANDIDATES[instance.documents[document_id].finalized_candidate_id].segments)
+                    for document_id in job.document_ids
+                }
+            persist_state()
+    except JobCancelled:
+        with STATE_LOCK:
+            job = JOBS.get(job_id)
+            if job:
+                job.state = JobState.CANCELLED
+                job.current_step = "전체 문서 재인덱싱을 중단했어요."
+                job.completed_at = datetime.now(UTC)
+                instance = INSTANCES.get(job.instance_id)
+                if instance:
+                    for document_id in job.document_ids:
+                        if document := instance.documents.get(document_id):
+                            document.full_reindex_state = JobState.CANCELLED
+                artifact = ARTIFACTS.get(job.artifact_id) if job.artifact_id else None
+                if artifact:
+                    artifact.status = ArtifactStatus.FAILED
+                    artifact.metadata["cancelled"] = True
+                    artifact.updated_at = datetime.now(UTC)
+                persist_state()
+    except Exception as error:  # pragma: no cover - defensive worker boundary
+        with STATE_LOCK:
+            job = JOBS.get(job_id)
+            if job:
+                job.state = JobState.FAILED
+                job.current_step = "전체 문서 재인덱싱을 마치지 못했어요."
+                job.error_message = str(error)
+                job.completed_at = datetime.now(UTC)
+                instance = INSTANCES.get(job.instance_id)
+                if instance:
+                    for document_id in job.document_ids:
+                        if document := instance.documents.get(document_id):
+                            document.full_reindex_state = JobState.FAILED
+                artifact = ARTIFACTS.get(job.artifact_id) if job.artifact_id else None
+                if artifact:
+                    artifact.status = ArtifactStatus.FAILED
+                    artifact.updated_at = datetime.now(UTC)
+                    artifact.metadata["error"] = str(error)
                 persist_state()
 
 
@@ -1341,6 +2052,10 @@ def start_processing_job(job: ProcessingJob, mode: PipelineMode, reuse_source_do
     )
 
 
+def start_full_reindex_job(job: ProcessingJob) -> None:
+    dispatch(job.id, lambda: run_full_reindex_job(job.id))
+
+
 def resume_pending_jobs() -> None:
     for job in list(JOBS.values()):
         if job.state not in {JobState.QUEUED, JobState.PARSING, JobState.GENERATING_CANDIDATES, JobState.INDEXING}:
@@ -1350,7 +2065,10 @@ def resume_pending_jobs() -> None:
             continue
         if not instance.documents.get(job.document_ids[0]):
             continue
-        start_processing_job(job, job.pipeline_mode, job.reuse_source_document_id)
+        if job.kind == JobKind.FULL_REINDEX:
+            start_full_reindex_job(job)
+        else:
+            start_processing_job(job, job.pipeline_mode, job.reuse_source_document_id)
 
 
 restore_state()
@@ -1363,6 +2081,46 @@ def reuse_source_for(instance: RagInstance, requested_document_id: str | None) -
         if document and document.finalized_candidate_id:
             return document, CANDIDATES[document.finalized_candidate_id]
     return None
+
+
+def schedule_full_reindex(instance: RagInstance, document: Document) -> tuple[ProcessingJob, Artifact] | None:
+    """Persist and enqueue full indexing only when tuning used a bounded sample."""
+    if document.comparison_scope != ComparisonScope.SAMPLE:
+        return None
+    artifact = register_artifact(
+        instance,
+        type="FULL_REINDEX",
+        title=f"{document.filename} 전체 문서 재인덱싱",
+        context_document_ids=[document.id],
+        metadata={
+            "context_status": "AVAILABLE",
+            "summary": "샘플 비교에서 선택한 설정으로 전체 문서를 재인덱싱할 예정입니다.",
+            "comparison": comparison_plan_payload(document),
+            "selected_pipeline_id": document.finalized_candidate_id,
+        },
+        artifact_status=ArtifactStatus.PROCESSING,
+    )
+    job = ProcessingJob(
+        id=new_id(),
+        instance_id=instance.id,
+        document_ids=[document.id],
+        state=JobState.QUEUED,
+        current_step="전체 문서 재인덱싱을 시작할 예정이에요.",
+        completed_units=0,
+        total_units=2,
+        created_at=datetime.now(UTC),
+        stages=full_reindex_stages(),
+        artifact_id=artifact.id,
+        pipeline_mode=document.pipeline_mode,
+        kind=JobKind.FULL_REINDEX,
+        comparison_plans={document.id: comparison_plan_payload(document)},
+    )
+    JOBS[job.id] = job
+    document.full_reindex_job_id = job.id
+    document.full_reindex_state = JobState.QUEUED
+    persist_state()
+    start_full_reindex_job(job)
+    return job, artifact
 
 
 @app.post(f"{API_PREFIX}/rag-instances/{{instance_id}}/documents", status_code=status.HTTP_202_ACCEPTED)
@@ -1386,6 +2144,13 @@ def upload_documents(instance_id: str, body: DocumentsCreate) -> dict:
             parse_status="UPLOADED",
         )
         document.pipeline_mode = mode
+        # Text uploads can expose their comparison cost immediately. Binary
+        # sources are authoritatively recalculated after the async parser runs.
+        if item.content:
+            document.segments = split_segments(item.content)
+            document.chunking_analysis = analyze_document_for_chunking(document)
+            document.profile = document_profile(document, document.chunking_analysis)
+            configure_comparison_scope(document)
         instance.documents[document.id] = document
         created.append(document)
     instance.status = InstanceStatus.SETTING_UP
@@ -1394,7 +2159,12 @@ def upload_documents(instance_id: str, body: DocumentsCreate) -> dict:
         type="PROCESSING_RUN",
         title="문서 준비 작업",
         context_document_ids=[item.id for item in created],
-        metadata={"pipeline_mode": mode, "context_status": "AVAILABLE", "summary": "문서 준비를 시작했어요."},
+        metadata={
+            "pipeline_mode": mode,
+            "context_status": "AVAILABLE",
+            "summary": "문서 준비를 시작했어요.",
+            "comparison_plans": {document.id: comparison_plan_payload(document) for document in created},
+        },
         artifact_status=ArtifactStatus.PROCESSING,
     )
     job = ProcessingJob(
@@ -1410,6 +2180,7 @@ def upload_documents(instance_id: str, body: DocumentsCreate) -> dict:
         artifact_id=artifact.id,
         pipeline_mode=mode,
         reuse_source_document_id=reuse_source[0].id if reuse_source else None,
+        comparison_plans={document.id: comparison_plan_payload(document) for document in created},
     )
     JOBS[job.id] = job
     for document in created:
@@ -1419,14 +2190,32 @@ def upload_documents(instance_id: str, body: DocumentsCreate) -> dict:
         "next_action": "TUNE_DOCUMENT" if mode == PipelineMode.RETUNE else "SEARCH_READY",
         "reuse_source_document_id": reuse_source[0].id if reuse_source else None,
         "message": "답변 비교를 시작해 이 문서에 맞는 설정을 고르세요." if mode == PipelineMode.RETUNE else "기존에 확정한 설정을 적용했습니다. 바로 검색할 수 있습니다.",
+        "comparison_scope": ComparisonScope.SAMPLE if any(document.comparison_scope == ComparisonScope.SAMPLE for document in created) else ComparisonScope.FULL,
+        "estimated_chunk_count": max((document.estimated_chunk_count for document in created), default=0),
+        "selected_chunk_count": max((document.selected_chunk_count for document in created), default=0),
+        "comparison_plans": {document.id: comparison_plan_payload(document) for document in created},
     }
     persist_state()
     start_processing_job(job, mode, reuse_source[0].id if reuse_source else None)
     return {"job": job_payload(job), "artifact": artifact_payload(artifact), "decision": decision, "documents": [document_payload(item) for item in created]}
 
 
+def job_has_failed_candidates(job: ProcessingJob) -> bool:
+    instance = INSTANCES.get(job.instance_id)
+    if not instance:
+        return False
+    return any(
+        candidate is not None and candidate.preparation_state == CandidateState.FAILED
+        for document_id in job.document_ids
+        for document in [instance.documents.get(document_id)]
+        if document is not None
+        for candidate_id in document.candidate_ids
+        for candidate in [CANDIDATES.get(candidate_id)]
+    )
+
+
 def job_payload(job: ProcessingJob) -> dict:
-    return {"id": job.id, "instance_id": job.instance_id, "document_ids": job.document_ids, "state": job.state, "current_step": job.current_step, "progress": {"completed": job.completed_units, "total": job.total_units}, "stages": job.stages, "artifact_id": job.artifact_id, "can_retry": job.state in {JobState.FAILED, JobState.CANCELLED}, "can_cancel": job.state in {JobState.QUEUED, JobState.PARSING, JobState.GENERATING_CANDIDATES, JobState.INDEXING}, "attempt": job.attempt, "queue_backend": backend_name(), "created_at": job.created_at.isoformat(), "completed_at": job.completed_at.isoformat() if job.completed_at else None, "error_message": job.error_message}
+    return {"id": job.id, "instance_id": job.instance_id, "document_ids": job.document_ids, "kind": job.kind, "state": job.state, "current_step": job.current_step, "progress": {"completed": job.completed_units, "total": job.total_units}, "stages": job.stages, "artifact_id": job.artifact_id, "comparison_plans": job.comparison_plans, "can_retry": job.state in {JobState.FAILED, JobState.CANCELLED} or job_has_failed_candidates(job), "can_cancel": job.state in {JobState.QUEUED, JobState.PARSING, JobState.GENERATING_CANDIDATES, JobState.INDEXING}, "attempt": job.attempt, "queue_backend": backend_name(), "created_at": job.created_at.isoformat(), "completed_at": job.completed_at.isoformat() if job.completed_at else None, "error_message": job.error_message}
 
 
 @app.get(f"{API_PREFIX}/rag-jobs/{{job_id}}")
@@ -1455,9 +2244,27 @@ def retry_job(job_id: str) -> dict:
     job = JOBS.get(job_id)
     if not job:
         raise not_found("작업")
-    if job.state not in {JobState.FAILED, JobState.CANCELLED}:
-        raise HTTPException(409, detail={"code": "JOB_NOT_RETRYABLE", "message": "실패하거나 중단된 작업만 다시 시도할 수 있습니다."})
+    if job.state not in {JobState.FAILED, JobState.CANCELLED} and not job_has_failed_candidates(job):
+        raise HTTPException(409, detail={"code": "JOB_NOT_RETRYABLE", "message": "실패·중단되었거나 후보 준비에 실패한 작업만 다시 시도할 수 있습니다."})
     instance = get_instance(job.instance_id)
+    if job.kind == JobKind.FULL_REINDEX:
+        for document_id in job.document_ids:
+            if document := instance.documents.get(document_id):
+                document.full_reindex_state = JobState.QUEUED
+        job.state = JobState.QUEUED
+        job.current_step = "전체 문서 재인덱싱을 다시 시작할 예정이에요."
+        job.completed_units = 0
+        job.completed_at = None
+        job.error_message = None
+        job.cancel_requested = False
+        job.attempt += 1
+        job.stages = full_reindex_stages()
+        persist_state()
+        start_full_reindex_job(job)
+        return job_payload(job)
+    for round_id, round_ in list(ROUNDS.items()):
+        if round_.instance_id == instance.id and set(round_.document_ids) & set(job.document_ids):
+            ROUNDS.pop(round_id)
     for document_id in job.document_ids:
         document = instance.documents.get(document_id)
         if not document:
@@ -1520,12 +2327,23 @@ def compare_candidates(instance_id: str, body: CompareRequest) -> dict:
     round_ = ComparisonRound(id=new_id(), instance_id=instance.id, document_ids=body.document_ids, question=body.question, candidate_ids=candidate_ids, created_at=datetime.now(UTC))
     ROUNDS[round_.id] = round_
     results = comparison_results(instance, round_)
+    generation_results = [result.get("generation", {}) for result in results]
     artifact = register_artifact(
         instance,
         type="TUNING_COMPARISON",
         title=f"비교 라운드 · {body.question[:48]}",
         context_document_ids=body.document_ids,
-        metadata={"round_id": round_.id, "candidate_count": len(candidate_ids), "context_status": "AVAILABLE", "view": "answer_with_inline_citations"},
+        metadata={
+            "round_id": round_.id,
+            "candidate_count": len(candidate_ids),
+            "context_status": "AVAILABLE",
+            "view": "answer_with_inline_citations",
+            "generation": {
+                "providers": sorted({item.get("provider") for item in generation_results if item.get("provider")}),
+                "fallback_count": sum(1 for item in generation_results if item.get("fallback")),
+                "grounding_valid": all(item.get("grounding_valid", False) for item in generation_results if item),
+            },
+        },
         payload={"question": body.question, "candidate_ids": candidate_ids},
     )
     persist_state()
@@ -1533,7 +2351,16 @@ def compare_candidates(instance_id: str, body: CompareRequest) -> dict:
 
 
 def round_payload(round_: ComparisonRound) -> dict:
-    return {"id": round_.id, "instance_id": round_.instance_id, "document_ids": round_.document_ids, "question": round_.question, "candidate_ids": round_.candidate_ids, "selected_candidate_ids": round_.selected_candidate_ids, "created_at": round_.created_at.isoformat()}
+    return {
+        "id": round_.id,
+        "instance_id": round_.instance_id,
+        "document_ids": round_.document_ids,
+        "question": round_.question,
+        "candidate_ids": round_.candidate_ids,
+        "selected_candidate_ids": round_.selected_candidate_ids,
+        "candidate_states": round_.candidate_states,
+        "created_at": round_.created_at.isoformat(),
+    }
 
 
 def comparison_results(instance: RagInstance, round_: ComparisonRound) -> list[dict]:
@@ -1545,6 +2372,36 @@ def comparison_results(instance: RagInstance, round_: ComparisonRound) -> list[d
         document = instance.documents.get(candidate.document_id)
         if not document:
             continue
+        if candidate.preparation_state != CandidateState.READY:
+            state = candidate.preparation_state
+            round_.candidate_states[candidate.id] = state
+            results.append(
+                {
+                    "candidate": candidate_payload(candidate),
+                    "candidate_state": state,
+                    "candidate_state_detail": candidate.preparation_error
+                    or "후보 검색 인덱스를 준비하고 있어요.",
+                    "answer": "이 후보는 아직 비교할 수 없습니다.",
+                    "citations": [],
+                    "relevance": 0.0,
+                    "grounded": False,
+                    "generation": {
+                        "mode": "NOT_ATTEMPTED",
+                        "provider": None,
+                        "fallback": False,
+                        "fallback_reason": "CANDIDATE_NOT_READY",
+                        "grounding_valid": True,
+                        "supplied_segment_ids": [],
+                        "sentence_citation_ids": [],
+                    },
+                    "retrieval_metadata": {
+                        "provider": candidate.embedding_provider,
+                        "warning": candidate.embedding_warning,
+                    },
+                    "latency_ms": 0,
+                }
+            )
+            continue
         result = answer_for(
             document,
             round_.question,
@@ -1553,10 +2410,18 @@ def comparison_results(instance: RagInstance, round_: ComparisonRound) -> list[d
             vectors=candidate.vectors,
             embedding_model=instance.embedding_model,
         )
+        state = CandidateState.READY if result["citations"] else CandidateState.NO_EVIDENCE
+        round_.candidate_states[candidate.id] = state
         results.append(
             {
                 "candidate": candidate_payload(candidate),
                 **result,
+                "candidate_state": state,
+                "candidate_state_detail": (
+                    "비교할 근거를 찾았습니다."
+                    if state == CandidateState.READY
+                    else "현재 질문을 뒷받침하는 근거를 찾지 못했습니다."
+                ),
                 "latency_ms": 120 + (abs(hash(candidate.id + round_.question)) % 480),
             }
         )
@@ -1575,12 +2440,31 @@ def vote(round_id: str, body: VoteRequest) -> dict:
     unexpected = set(body.candidate_ids) - set(round_.candidate_ids)
     if unexpected:
         raise HTTPException(422, detail={"code": "CANDIDATE_NOT_IN_ROUND", "message": "현재 라운드에 없는 후보입니다.", "details": {"candidate_ids": sorted(unexpected)}})
+    instance = get_instance(round_.instance_id)
+    if not all(candidate_id in round_.candidate_states for candidate_id in round_.candidate_ids):
+        comparison_results(instance, round_)
+    unavailable = [
+        candidate_id
+        for candidate_id in body.candidate_ids
+        if round_.candidate_states.get(candidate_id) != CandidateState.READY
+    ]
+    if unavailable:
+        raise HTTPException(
+            422,
+            detail={
+                "code": "CANDIDATE_NOT_SELECTABLE",
+                "message": "준비되지 않았거나 근거가 없는 후보는 선택할 수 없습니다.",
+                "details": {
+                    "candidate_ids": unavailable,
+                    "states": {candidate_id: round_.candidate_states.get(candidate_id) for candidate_id in unavailable},
+                },
+            },
+        )
     if round_.selected_candidate_ids:
         raise HTTPException(409, detail={"code": "ROUND_ALREADY_VOTED", "message": "이 라운드에는 이미 투표했습니다."})
     round_.selected_candidate_ids = body.candidate_ids
     for candidate_id in body.candidate_ids:
         CANDIDATES[candidate_id].selection_count += 1
-    instance = get_instance(round_.instance_id)
     persist_state()
     return {"round": round_payload(round_), "tuning_status": tuning_status(instance, round_.document_ids)}
 
@@ -1626,11 +2510,26 @@ def finalize(instance_id: str, body: FinalizeRequest) -> dict:
         type="PIPELINE_DECISION",
         title=f"{document.filename}의 확정 설정",
         context_document_ids=[document.id],
-        metadata={"context_status": "AVAILABLE", "selection_count": winner.selection_count, "pipeline": candidate_payload(winner)},
+        metadata={
+            "context_status": "AVAILABLE",
+            "selection_count": winner.selection_count,
+            "pipeline": candidate_payload(winner),
+            "comparison": comparison_plan_payload(document),
+        },
         payload={"document_id": document.id, "candidate_id": winner.id},
     )
+    reindex = schedule_full_reindex(instance, document)
     persist_state()
-    return {"instance": instance_payload(instance, include_documents=True), "finalized_candidate": candidate_payload(winner), "artifact": artifact_payload(artifact)}
+    return {
+        "instance": instance_payload(instance, include_documents=True),
+        "finalized_candidate": candidate_payload(winner),
+        "artifact": artifact_payload(artifact),
+        "full_reindex": (
+            {"required": True, "job": job_payload(reindex[0]), "artifact": artifact_payload(reindex[1])}
+            if reindex
+            else {"required": False, "job": None, "artifact": None}
+        ),
+    }
 
 
 @app.post(f"{API_PREFIX}/rag-instances/{{instance_id}}/search")
@@ -1643,38 +2542,79 @@ def search(instance_id: str, body: SearchRequest) -> dict:
             raise not_found("문서")
         if not document.finalized_candidate_id:
             raise HTTPException(409, detail={"code": "DOCUMENT_NOT_FINALIZED", "message": "튜닝을 마친 문서만 실사용 검색에 포함할 수 있습니다."})
+        if document.full_reindex_state and document.full_reindex_state != JobState.SUCCEEDED:
+            raise HTTPException(
+                409,
+                detail={
+                    "code": "FULL_REINDEX_PENDING",
+                    "message": "샘플 비교에서 고른 설정으로 전체 문서를 재인덱싱 중입니다. 완료 후 검색할 수 있습니다.",
+                    "details": {"job_id": document.full_reindex_job_id, "state": document.full_reindex_state},
+                },
+            )
         documents.append(document)
-    configs = {CANDIDATES[document.finalized_candidate_id].retrieval_config for document in documents}
-    retrieval = body.retrieval_config or (next(iter(configs)) if len(configs) == 1 else "hybrid")
-    answers = [
-        answer_for(
+    if len(documents) == 1:
+        # Keep the established single-document retrieval and answer contract intact.
+        document = documents[0]
+        candidate = CANDIDATES[document.finalized_candidate_id]
+        retrieval = body.retrieval_config or candidate.retrieval_config
+        answer = answer_for(
             document,
             body.question,
             retrieval,
             body.sensitivity,
-            segments=CANDIDATES[document.finalized_candidate_id].segments,
-            vectors=CANDIDATES[document.finalized_candidate_id].vectors,
+            segments=candidate.segments,
+            vectors=candidate.vectors,
             embedding_model=instance.embedding_model,
         )
-        for document in documents
-    ]
-    grounded = [item for item in answers if item["grounded"]]
-    if not grounded:
-        answer = {"answer": "관련 문서를 찾지 못했습니다. 검색 범위나 질문을 조금 더 구체적으로 바꿔보세요.", "citations": [], "grounded": False, "relevance": 0.0}
+        answer["grouped_citations"] = grouped_citations(answer["citations"], documents)
     else:
-        best = max(grounded, key=lambda item: item["relevance"])
-        answer = {**best, "citations": [citation for item in grounded for citation in item["citations"]][:4]}
+        retrieval = body.retrieval_config or "per_document"
+        answer = answer_for_documents(
+            documents,
+            body.question,
+            body.sensitivity,
+            instance.embedding_model,
+            body.retrieval_config,
+        )
     citations = [{**citation, "number": index} for index, citation in enumerate(answer["citations"], start=1)]
+    grouped = grouped_citations(citations, documents)
     artifact = register_artifact(
         instance,
         type="ANSWER",
         title=f"검색 답변 · {body.question[:48]}",
         context_document_ids=body.document_ids,
-        metadata={"context_status": "AVAILABLE", "grounded": answer["grounded"], "relevance": answer["relevance"], "retrieval_config": retrieval, "sensitivity": body.sensitivity},
-        payload={"question": body.question, "answer": answer["answer"], "citations": citations},
+        metadata={
+            "context_status": "AVAILABLE",
+            "grounded": answer["grounded"],
+            "relevance": answer["relevance"],
+            "retrieval_config": retrieval,
+            "sensitivity": body.sensitivity,
+            "retrieval_metadata": answer.get("retrieval_metadata", {}),
+            "generation": answer.get("generation", {}),
+        },
+        payload={
+            "question": body.question,
+            "answer": answer["answer"],
+            "citations": citations,
+            "grouped_citations": grouped,
+            "retrieval_metadata": answer.get("retrieval_metadata", {}),
+            "generation": answer.get("generation", {}),
+        },
     )
     persist_state()
-    return {"question": body.question, "retrieval_config": retrieval, "sensitivity": body.sensitivity, "answer": answer["answer"], "citations": citations, "grounded": answer["grounded"], "relevance": answer["relevance"], "retrieval_metadata": answer.get("retrieval_metadata", {}), "artifact": artifact_payload(artifact)}
+    return {
+        "question": body.question,
+        "retrieval_config": retrieval,
+        "sensitivity": body.sensitivity,
+        "answer": answer["answer"],
+        "citations": citations,
+        "grouped_citations": grouped,
+        "grounded": answer["grounded"],
+        "relevance": answer["relevance"],
+        "retrieval_metadata": answer.get("retrieval_metadata", {}),
+        "generation": answer.get("generation", {}),
+        "artifact": artifact_payload(artifact),
+    }
 
 
 @app.get(f"{API_PREFIX}/rag-instances/{{instance_id}}/search/stream")
@@ -1683,9 +2623,9 @@ async def search_stream(instance_id: str, question: str, document_ids: list[str]
 
     async def events() -> AsyncIterator[str]:
         yield f"event: citations\ndata: {json.dumps(result['citations'], ensure_ascii=False)}\n\n"
-        for token in result["answer"].split(" "):
-            yield f"event: token\ndata: {json.dumps({'token': token + ' '}, ensure_ascii=False)}\n\n"
-        yield f"event: done\ndata: {json.dumps({'grounded': result['grounded'], 'relevance': result['relevance'], 'retrieval_metadata': result.get('retrieval_metadata', {}), 'artifact_id': result.get('artifact', {}).get('id')})}\n\n"
+        for index, token in enumerate(result["answer"].split(" ")):
+            yield f"event: token\ndata: {json.dumps({'token': token + ' ', 'index': index}, ensure_ascii=False)}\n\n"
+        yield f"event: done\ndata: {json.dumps({'grounded': result['grounded'], 'relevance': result['relevance'], 'grouped_citations': result.get('grouped_citations', []), 'retrieval_metadata': result.get('retrieval_metadata', {}), 'generation': result.get('generation', {}), 'artifact_id': result.get('artifact', {}).get('id')})}\n\n"
 
     return StreamingResponse(events(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
@@ -1804,6 +2744,8 @@ def retune_documents(instance_id: str, body: RetuneRequest) -> dict:
         document.candidate_ids = []
         document.finalized_candidate_id = None
         document.pipeline_mode = PipelineMode.RETUNE
+        document.full_reindex_job_id = None
+        document.full_reindex_state = None
         document.parse_status = "UPLOADED"
         document.segments = []
         documents.append(document)
