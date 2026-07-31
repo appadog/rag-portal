@@ -468,7 +468,7 @@ export function RagSetupPage() {
     void sync();
     const jobState = detail?.latestJob?.state;
     const timer =
-      jobState && !['SUCCEEDED', 'FAILED'].includes(jobState)
+      jobState && !['SUCCEEDED', 'FAILED', 'CANCELLED'].includes(jobState)
         ? window.setInterval(() => void sync(), 2000)
         : undefined;
     return () => {
@@ -481,6 +481,16 @@ export function RagSetupPage() {
     const result = await ragApi.upload(id, [...files]);
     setDetail(result);
     setRound(undefined);
+  };
+  const cancelPreparation = async () => {
+    if (!detail?.latestJob) return;
+    await ragApi.cancelJob(detail.latestJob.id);
+    setDetail(await ragApi.get(id));
+  };
+  const retryPreparation = async () => {
+    if (!detail?.latestJob) return;
+    await ragApi.retryJob(detail.latestJob.id);
+    setDetail(await ragApi.get(id));
   };
   const toggle = (candidateId: string) =>
     setSelected((items) =>
@@ -526,7 +536,7 @@ export function RagSetupPage() {
   if (!detail) return <LoadingState />;
   const isPreparing =
     Boolean(detail.latestJob) &&
-    !['SUCCEEDED', 'FAILED'].includes(detail.latestJob?.state ?? 'SUCCEEDED');
+    !['SUCCEEDED', 'FAILED', 'CANCELLED'].includes(detail.latestJob?.state ?? 'SUCCEEDED');
   if (!round && isPreparing)
     return (
       <>
@@ -562,7 +572,39 @@ export function RagSetupPage() {
             {detail.latestJob?.currentStep} · {detail.latestJob?.completed}/
             {detail.latestJob?.total} 단계 완료
           </small>
+          {detail.latestJob?.canCancel && (
+            <div style={{ marginTop: 16 }}>
+              <Button $variant="secondary" onClick={() => void cancelPreparation()}>
+                준비 중단
+              </Button>
+            </div>
+          )}
         </Progress>
+      </>
+    );
+  if (!round && detail.latestJob?.state && ['FAILED', 'CANCELLED'].includes(detail.latestJob.state))
+    return (
+      <>
+        <PageHeader>
+          <div>
+            <Pill $tone="warning">
+              문서 준비 {detail.latestJob.state === 'FAILED' ? '실패' : '중단'}
+            </Pill>
+            <h1>{detail.name}</h1>
+            <p>{detail.latestJob.errorMessage ?? detail.latestJob.currentStep}</p>
+          </div>
+          <Button $variant="secondary" onClick={() => navigate('/rag')}>
+            대시보드로
+          </Button>
+        </PageHeader>
+        <Card style={{ padding: 20 }}>
+          <p style={{ marginTop: 0, color: theme.colors.muted }}>
+            원본 문서와 선택한 모델 설정은 유지됩니다. 준비 작업만 다시 시도할 수 있어요.
+          </p>
+          <Button onClick={() => void retryPreparation()} disabled={!detail.latestJob.canRetry}>
+            문서 준비 다시 시도
+          </Button>
+        </Card>
       </>
     );
   if (!round)

@@ -30,12 +30,20 @@ export interface RagInstance {
 
 export interface RagProcessingJob {
   id: string;
-  state: 'QUEUED' | 'PARSING' | 'GENERATING_CANDIDATES' | 'INDEXING' | 'SUCCEEDED' | 'FAILED';
+  state:
+    | 'QUEUED'
+    | 'PARSING'
+    | 'GENERATING_CANDIDATES'
+    | 'INDEXING'
+    | 'SUCCEEDED'
+    | 'FAILED'
+    | 'CANCELLED';
   currentStep: string;
   completed: number;
   total: number;
   canRetry: boolean;
   canCancel: boolean;
+  errorMessage?: string;
   stages: { key: string; label: string; state: 'QUEUED' | 'SUCCEEDED' | 'FAILED' }[];
 }
 
@@ -68,7 +76,20 @@ export interface RagInstanceDetail extends RagInstance {
 export interface CreateRagInput {
   name: string;
   embeddingModel: string;
-  graphragEnabled: boolean;
+  questionnaire: {
+    primaryLanguage: string;
+    requiresOnPremise: boolean;
+    budget: string;
+    multiHopQuestions: boolean;
+  };
+}
+
+export interface EmbeddingModelRecommendation {
+  id: string;
+  label: string;
+  reason: string;
+  tradeoff: string;
+  recommended: boolean;
 }
 
 export interface ChatAnswer {

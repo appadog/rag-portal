@@ -2,6 +2,7 @@ import type {
   ChatAnswer,
   ComparisonRound,
   CreateRagInput,
+  EmbeddingModelRecommendation,
   PipelineCandidate,
   RagDocument,
   RagInstance,
@@ -14,6 +15,15 @@ import { candidateFixtures, mockInstances, mockRound } from '../mocks/ragFixture
 const baseUrl = import.meta.env.VITE_API_BASE_URL?.replace(/\/$/, '');
 let localInstances = [...mockInstances];
 type Json = Record<string, unknown>;
+
+function base64FromBytes(bytes: Uint8Array): string {
+  let binary = '';
+  const chunkSize = 0x8000;
+  for (let index = 0; index < bytes.length; index += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(index, index + chunkSize));
+  }
+  return btoa(binary);
+}
 
 export type AnswerStreamOptions = {
   signal?: AbortSignal;
@@ -94,6 +104,7 @@ function jobFromWire(job: Json | undefined): RagProcessingJob | undefined {
     total: Number(progress.total ?? 0),
     canRetry: Boolean(job.can_retry),
     canCancel: Boolean(job.can_cancel),
+    errorMessage: typeof job.error_message === 'string' ? job.error_message : undefined,
     stages: ((job.stages as Json[] | undefined) ?? []).map((stage) => ({
       key: String(stage.key),
       label: String(stage.label),
@@ -180,16 +191,81 @@ function instanceFromWire(item: Json, detail = false): RagInstanceDetail {
     lastRound,
   };
 }
-function makeQuestionnaire(input: CreateRagInput) {
+function questionnaireFromInput(input: CreateRagInput) {
   return {
-    primary_language: input.embeddingModel === 'BGE-M3' ? 'ko' : 'multi',
-    requires_on_premise: input.embeddingModel === 'Qwen3-Embedding-0.6B',
-    budget: 'standard',
-    multi_hop_questions: input.graphragEnabled,
+    primary_language: input.questionnaire.primaryLanguage,
+    requires_on_premise: input.questionnaire.requiresOnPremise,
+    budget: input.questionnaire.budget,
+    multi_hop_questions: input.questionnaire.multiHopQuestions,
+    embedding_model: input.embeddingModel,
   };
 }
 
+function recommendationFromWire(item: Json): EmbeddingModelRecommendation {
+  return {
+    id: String(item.id),
+    label: String(item.label),
+    reason: String(item.reason),
+    tradeoff: String(item.tradeoff),
+    recommended: Boolean(item.recommended),
+  };
+}
+
+function fallbackRecommendations(
+  input: CreateRagInput['questionnaire'],
+): EmbeddingModelRecommendation[] {
+  const items: EmbeddingModelRecommendation[] = [
+    {
+      id: 'BGE-M3',
+      label: '균형형 다국어 검색',
+      reason: '한국어·영어가 섞인 문서와 하이브리드 검색을 폭넓게 다룰 수 있어요.',
+      tradeoff: '가벼운 모델보다 운영 자원이 더 필요할 수 있어요.',
+      recommended: input.primaryLanguage === 'ko' && !input.requiresOnPremise,
+    },
+    {
+      id: 'Qwen3-Embedding-0.6B',
+      label: '자체 운영 우선',
+      reason: '상대적으로 가벼워 사내·폐쇄망 환경에서 시작하기 좋습니다.',
+      tradeoff: '복잡한 다국어 의미 검색은 실제 문서로 확인이 필요해요.',
+      recommended: input.requiresOnPremise,
+    },
+    {
+      id: 'EmbeddingGemma-300M',
+      label: '경량 운영형',
+      reason: '작은 운영 비용으로 빠르게 기준선을 만들고 싶을 때 적합합니다.',
+      tradeoff: '난도가 높은 문서에서는 실측 벤치마크가 필요해요.',
+      recommended: input.budget === 'low' && !input.requiresOnPremise,
+    },
+  ];
+  return items.map((item, index) => ({
+    ...item,
+    recommended: item.recommended || (!items.some((choice) => choice.recommended) && index === 0),
+  }));
+}
+
 export const ragApi = {
+  async recommendEmbeddingModels(
+    questionnaire: CreateRagInput['questionnaire'],
+  ): Promise<EmbeddingModelRecommendation[]> {
+    try {
+      const data = await request<{ items: Json[] }>(
+        '/api/v1/rag-instances/embedding-recommendations',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            primary_language: questionnaire.primaryLanguage,
+            requires_on_premise: questionnaire.requiresOnPremise,
+            budget: questionnaire.budget,
+            multi_hop_questions: questionnaire.multiHopQuestions,
+          }),
+        },
+      );
+      return data.items.map(recommendationFromWire);
+    } catch {
+      await wait();
+      return fallbackRecommendations(questionnaire);
+    }
+  },
   async list(): Promise<RagInstance[]> {
     try {
       const data = await request<{ items: Json[] }>('/api/v1/rag-instances');
@@ -212,7 +288,7 @@ export const ragApi = {
       return instanceFromWire(
         await request<Json>('/api/v1/rag-instances', {
           method: 'POST',
-          body: JSON.stringify({ name: input.name, questionnaire: makeQuestionnaire(input) }),
+          body: JSON.stringify({ name: input.name, questionnaire: questionnaireFromInput(input) }),
         }),
       );
     } catch {
@@ -221,7 +297,7 @@ export const ragApi = {
         name: input.name,
         status: 'SETTING_UP',
         embeddingModel: input.embeddingModel,
-        graphragEnabled: input.graphragEnabled,
+        graphragEnabled: input.questionnaire.multiHopQuestions,
         documents: [],
         candidates: [],
         progress: { stage: 'WAITING_FOR_DOCUMENT', completed: 0, total: 0 },
@@ -238,11 +314,14 @@ export const ragApi = {
   ): Promise<RagInstanceDetail> {
     try {
       const documents = await Promise.all(
-        files.map(async (file) => ({
-          filename: file.name,
-          content_type: file.type || 'text/plain',
-          content: (await file.text()) || `문서 ${file.name}의 내용`,
-        })),
+        files.map(async (file) => {
+          const bytes = new Uint8Array(await file.arrayBuffer());
+          return {
+            filename: file.name,
+            content_type: file.type || 'application/octet-stream',
+            content_base64: base64FromBytes(bytes),
+          };
+        }),
       );
       await request(`/api/v1/rag-instances/${id}/documents`, {
         method: 'POST',
@@ -262,6 +341,20 @@ export const ragApi = {
       instance.candidates = mockRound.candidates;
       instance.lastRound = mockRound;
       return instance;
+    }
+  },
+  async cancelJob(jobId: string): Promise<void> {
+    try {
+      await request(`/api/v1/rag-jobs/${jobId}/cancel`, { method: 'POST' });
+    } catch {
+      await wait();
+    }
+  },
+  async retryJob(jobId: string): Promise<void> {
+    try {
+      await request(`/api/v1/rag-jobs/${jobId}/retry`, { method: 'POST' });
+    } catch {
+      await wait();
     }
   },
   async compare(id: string, question: string, documentIds: string[]): Promise<ComparisonRound> {

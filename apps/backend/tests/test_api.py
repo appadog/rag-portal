@@ -1,9 +1,15 @@
+import base64
+from io import BytesIO
 import time
 
 from fastapi.testclient import TestClient
+from docx import Document as DocxDocument
+import fitz
+from openpyxl import Workbook
 
 from app import main
 from app.main import app
+from app.retrieval import bm25_scores, embed, rank
 
 
 client = TestClient(app)
@@ -16,6 +22,8 @@ def test_openapi_includes_workspace_state_contract() -> None:
     assert "/api/v1/rag-instances/{instance_id}/jobs" in paths
     assert "/api/v1/rag-instances/{instance_id}/artifacts" in paths
     assert "/api/v1/documents/{document_id}/segments/{segment_id}" in paths
+    assert "/api/v1/model-runtime" in paths
+    assert "/api/v1/rag-instances/{instance_id}/execution-plan" in paths
 
 
 def test_loopback_vite_ports_are_allowed_by_cors() -> None:
@@ -29,6 +37,154 @@ def test_loopback_vite_ports_are_allowed_by_cors() -> None:
 
     assert response.status_code == 200
     assert response.headers["access-control-allow-origin"] == "http://127.0.0.1:5175"
+
+
+def test_embedding_candidates_are_ranked_and_the_selected_candidate_is_persisted() -> None:
+    recommendations = client.post(
+        "/api/v1/rag-instances/embedding-recommendations",
+        json={"primary_language": "ko", "requires_on_premise": True, "budget": "standard"},
+    )
+    assert recommendations.status_code == 200
+    items = recommendations.json()["items"]
+    assert [item["id"] for item in items] == [
+        "Qwen3-Embedding-0.6B",
+        "BGE-M3",
+        "EmbeddingGemma-300M",
+    ]
+    assert items[0]["recommended"] is True
+    assert all({"label", "reason", "tradeoff"} <= item.keys() for item in items)
+
+    created = client.post(
+        "/api/v1/rag-instances",
+        json={
+            "name": "후보 선택 RAG",
+            "questionnaire": {
+                "primary_language": "ko",
+                "requires_on_premise": True,
+                "embedding_model": "BGE-M3",
+            },
+        },
+    )
+    assert created.status_code == 201
+    assert created.json()["embedding_model"] == "BGE-M3"
+    assert len(created.json()["recommendation"]["candidates"]) == 3
+
+
+def test_model_runtime_and_instance_execution_plan_explain_required_services() -> None:
+    runtime = client.get("/api/v1/model-runtime")
+    assert runtime.status_code == 200
+    services = {service["key"]: service for service in runtime.json()["services"]}
+    assert services["embedding-bge-m3"]["technique"] == "embedding"
+    assert services["reranker-bge-m3"]["technique"] == "reranking"
+    assert services["ocr-tesseract-kor-eng"]["technique"] == "ocr"
+
+    instance_id = create_instance()
+    plan = client.get(f"/api/v1/rag-instances/{instance_id}/execution-plan")
+    assert plan.status_code == 200
+    keys = {service["key"] for service in plan.json()["required_services"]}
+    assert {"embedding-bge-m3", "reranker-bge-m3"} <= keys
+
+
+def test_docx_and_xlsx_are_extracted_before_candidate_indexing() -> None:
+    docx = DocxDocument()
+    docx.add_heading("출장 규정", level=1)
+    docx.add_paragraph("국내 출장 숙박비는 1박 10만원을 한도로 합니다.")
+    docx_table = docx.add_table(rows=2, cols=2)
+    docx_table.cell(0, 0).text = "항목"
+    docx_table.cell(0, 1).text = "한도"
+    docx_table.cell(1, 0).text = "식비"
+    docx_table.cell(1, 1).text = "150달러"
+    docx_buffer = BytesIO()
+    docx.save(docx_buffer)
+
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.title = "국내 출장"
+    worksheet.append(["항목", "한도"])
+    worksheet.append(["숙박비", "10만원"])
+    xlsx_buffer = BytesIO()
+    workbook.save(xlsx_buffer)
+
+    pdf = fitz.open()
+    page = pdf.new_page()
+    page.insert_text((72, 72), "Domestic travel lodging is limited to 100,000 won.")
+    pdf_bytes = pdf.tobytes()
+
+    instance_id = create_instance()
+    upload = client.post(
+        f"/api/v1/rag-instances/{instance_id}/documents",
+        json={
+            "documents": [
+                {
+                    "filename": "travel.docx",
+                    "content_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    "content_base64": base64.b64encode(docx_buffer.getvalue()).decode(),
+                },
+                {
+                    "filename": "travel.xlsx",
+                    "content_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    "content_base64": base64.b64encode(xlsx_buffer.getvalue()).decode(),
+                },
+                {
+                    "filename": "travel.pdf",
+                    "content_type": "application/pdf",
+                    "content_base64": base64.b64encode(pdf_bytes).decode(),
+                },
+            ]
+        },
+    ).json()
+    assert wait_for_job(upload["job"]["id"])["state"] == "SUCCEEDED"
+    documents = main.INSTANCES[instance_id].documents
+    parsed_docx = next(document for document in documents.values() if document.filename.endswith(".docx"))
+    parsed_xlsx = next(document for document in documents.values() if document.filename.endswith(".xlsx"))
+    parsed_pdf = next(document for document in documents.values() if document.filename.endswith(".pdf"))
+    assert parsed_docx.parser == "python-docx"
+    assert "150달러" in parsed_docx.content
+    assert parsed_xlsx.parser == "openpyxl"
+    assert "숙박비 | 10만원" in parsed_xlsx.content
+    assert parsed_pdf.parser == "pypdf"
+    assert "lodging" in parsed_pdf.content
+    assert all(main.CANDIDATES[candidate_id].vectors for document in documents.values() for candidate_id in document.candidate_ids)
+
+
+def test_processing_job_can_be_cancelled_and_retried() -> None:
+    instance_id = create_instance()
+    upload = client.post(
+        f"/api/v1/rag-instances/{instance_id}/documents",
+        json={"documents": [{"filename": "retry.txt", "content": "국내 출장 숙박비는 1박 10만원입니다."}]},
+    ).json()
+    job_id = upload["job"]["id"]
+    assert wait_for_job(job_id)["state"] == "SUCCEEDED"
+    job = main.JOBS[job_id]
+
+    job.state = main.JobState.QUEUED
+    cancelled = client.post(f"/api/v1/rag-jobs/{job_id}/cancel")
+    assert cancelled.status_code == 200
+    assert cancelled.json()["can_cancel"] is True
+    main.run_processing_job(job_id, job.pipeline_mode, job.reuse_source_document_id)
+    assert client.get(f"/api/v1/rag-jobs/{job_id}").json()["state"] == "CANCELLED"
+
+    retried = client.post(f"/api/v1/rag-jobs/{job_id}/retry")
+    assert retried.status_code == 200
+    assert retried.json()["attempt"] == 2
+    assert wait_for_job(job_id)["state"] == "SUCCEEDED"
+
+
+def test_bm25_dense_hybrid_and_rerank_use_the_prepared_vector_index() -> None:
+    texts = ["국내 출장 숙박비는 1박 10만원입니다.", "해외 출장 식비는 150달러입니다."]
+    vectors = embed(texts, "BGE-M3").vectors
+    assert bm25_scores("국내 출장 숙박비", texts)[0] > bm25_scores("국내 출장 숙박비", texts)[1]
+    for retrieval_config in ("bm25", "dense", "hybrid", "hybrid_rerank"):
+        scores, query_batch, metadata = rank(
+            query="국내 출장 숙박비",
+            texts=texts,
+            vectors=vectors,
+            retrieval_config=retrieval_config,
+            model_name="BGE-M3",
+        )
+        assert len(scores) == 2
+        assert query_batch.dimension == len(vectors[0])
+        assert "reranker_provider" in metadata
 
 
 def create_instance() -> str:
@@ -141,6 +297,50 @@ def test_candidate_pipelines_use_distinct_persisted_chunks_and_citations() -> No
     citation = result["citations"][0]
     assert citation["segment_id"] in {segment.id for segment in hierarchical_candidate.segments}
     assert client.get(citation["navigate_url"]).status_code == 200
+
+
+def test_chunking_candidates_adapt_parameters_to_document_shape_and_expose_reasons() -> None:
+    instance_id = create_instance()
+    long_section = "세부 규정은 사전 승인과 증빙 보관을 요구합니다. " * 120
+    structured_content = f"""제1조 목적
+{long_section}
+
+제2조 국내 출장
+국내 출장 숙박비는 1박 10만원을 한도로 합니다.
+
+제3조 해외 출장
+해외 출장 식비는 국가 등급에 따라 달라집니다."""
+    table_content = "항목 | 한도\n숙박비 | 10만원\n식비 | 150달러\n교통비 | 실비\n항공료 | 사전 승인"
+    upload = client.post(
+        f"/api/v1/rag-instances/{instance_id}/documents",
+        json={
+            "documents": [
+                {"filename": "travel-policy.txt", "content": structured_content},
+                {"filename": "travel-limits.csv", "content": table_content},
+            ]
+        },
+    ).json()
+    assert wait_for_job(upload["job"]["id"])["state"] == "SUCCEEDED"
+
+    detail = client.get(f"/api/v1/rag-instances/{instance_id}").json()
+    structured = next(document for document in detail["documents"] if document["filename"] == "travel-policy.txt")
+    table = next(document for document in detail["documents"] if document["filename"] == "travel-limits.csv")
+    assert structured["profile"] == "structured"
+    assert structured["chunking_analysis"]["heading_count"] == 3
+    assert table["profile"] == "table"
+
+    hierarchical = next(candidate for candidate in structured["candidates"] if candidate["chunking_strategy"] == "hierarchical")
+    semantic = next(candidate for candidate in structured["candidates"] if candidate["chunking_strategy"] == "semantic")
+    table_candidate = next(candidate for candidate in table["candidates"] if candidate["chunking_strategy"] == "table")
+    assert hierarchical["chunking_parameters"]["preserve_heading"] is True
+    assert hierarchical["chunking_parameters"]["max_section_chars"] >= 800
+    assert hierarchical["chunk_count"] > 3  # The oversized first section is split at the calculated limit.
+    assert semantic["chunking_parameters"]["target_chars"] >= 420
+    assert table_candidate["chunking_parameters"]["rows_per_chunk"] >= 3
+    assert "표 형태" in table_candidate["selection_reason"]
+
+    persisted = next(item for item in main.state_payload()["candidates"] if item["id"] == hierarchical["id"])
+    assert persisted["chunking_parameters"] == hierarchical["chunking_parameters"]
 
 
 def finalize_single_document(instance_id: str, content: str = "제7조 국내 출장 숙박비는 1박 10만원을 한도로 합니다.") -> str:

@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import styled from 'styled-components';
 import { ragApi } from '../shared/api/client';
+import type { EmbeddingModelRecommendation } from '../shared/api/types';
 import { Button, Card, Input, Pill } from '../shared/ui/primitives';
 import { theme } from '../shared/styles/theme';
 
@@ -86,6 +87,47 @@ const Field = styled.label`
     margin: 6px 0 8px;
   }
 `;
+const ModelChoices = styled.div`
+  display: grid;
+  gap: 10px;
+  margin: 20px 0;
+`;
+const ModelChoice = styled.label<{ $selected: boolean }>`
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 12px;
+  cursor: pointer;
+  border: 1px solid ${({ $selected }) => ($selected ? theme.colors.brand : theme.colors.line)};
+  background: ${({ $selected }) => ($selected ? theme.colors.brandSoft : theme.colors.surface)};
+  padding: 16px;
+  border-radius: ${theme.radius.md};
+  input {
+    margin: 3px 0 0;
+  }
+  strong,
+  span {
+    display: block;
+  }
+  strong {
+    font-size: 15px;
+  }
+  .model-name {
+    margin-top: 3px;
+    color: ${theme.colors.muted};
+    font-size: 12px;
+    font-weight: 700;
+  }
+  .model-copy,
+  .model-tradeoff {
+    margin-top: 7px;
+    color: ${theme.colors.muted};
+    font-size: 13px;
+    line-height: 1.5;
+  }
+  .model-tradeoff {
+    color: ${theme.colors.ink};
+  }
+`;
 
 export function RagCreatePage() {
   const navigate = useNavigate();
@@ -95,15 +137,34 @@ export function RagCreatePage() {
   const [multiHop, setMultiHop] = useState('no');
   const [name, setName] = useState('새 지식 공간');
   const [saving, setSaving] = useState(false);
-  const model =
-    privateData === 'yes' ? 'BGE-M3' : language === 'ko' ? 'BGE-M3' : 'Qwen3-Embedding-0.6B';
+  const [recommendations, setRecommendations] = useState<EmbeddingModelRecommendation[]>([]);
+  const [selectedModel, setSelectedModel] = useState('');
+  const [loadingRecommendations, setLoadingRecommendations] = useState(false);
+  const questionnaire = {
+    primaryLanguage: language,
+    requiresOnPremise: privateData === 'yes',
+    budget: 'standard',
+    multiHopQuestions: multiHop === 'yes',
+  };
+  const showRecommendations = async () => {
+    setLoadingRecommendations(true);
+    try {
+      const items = await ragApi.recommendEmbeddingModels(questionnaire);
+      setRecommendations(items);
+      setSelectedModel(items.find((item) => item.recommended)?.id ?? items[0]?.id ?? '');
+      setStep(2);
+    } finally {
+      setLoadingRecommendations(false);
+    }
+  };
   const create = async () => {
+    if (!selectedModel) return;
     setSaving(true);
     try {
       const item = await ragApi.create({
         name,
-        embeddingModel: model,
-        graphragEnabled: multiHop === 'yes',
+        embeddingModel: selectedModel,
+        questionnaire,
       });
       navigate(`/rag/${item.id}/setup`);
     } finally {
@@ -123,7 +184,7 @@ export function RagCreatePage() {
         </span>
         <span>—</span>
         <span className={step >= 2 ? 'on' : ''}>
-          <i className="dot">2</i> 이름 정하기
+          <i className="dot">2</i> 모델 선택
         </span>
         <span>—</span>
         <span>
@@ -191,17 +252,39 @@ export function RagCreatePage() {
             ))}
           </Choices>
           <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 24 }}>
-            <Button onClick={() => setStep(2)}>추천 확인하기 →</Button>
+            <Button onClick={() => void showRecommendations()} disabled={loadingRecommendations}>
+              {loadingRecommendations ? '추천을 준비하는 중…' : '후보 비교하기 →'}
+            </Button>
           </div>
         </Card>
       ) : (
         <Card style={{ padding: 28 }}>
-          <Pill $tone="brand">추천 모델 · {model}</Pill>
-          <h2>이 모델로 시작해 볼까요?</h2>
+          <Pill $tone="brand">임베딩 모델 후보</Pill>
+          <h2>문서 전체에 사용할 모델을 선택해 주세요.</h2>
           <p style={{ color: theme.colors.muted, lineHeight: 1.6 }}>
-            문서 전체에서 같은 임베딩 모델을 사용해 검색 결과가 일관되게 비교됩니다. 나중에 실제
-            문서 기준으로 다시 검증할 수 있어요.
+            추천은 출발점일 뿐이에요. 선택은 이 지식 공간의 설정으로 저장되고, 실제 임베딩 연결
+            뒤에는 모든 문서가 같은 임베딩 공간을 사용합니다. 현재 로컬 미리보기 검색은 비교
+            기준선인 lexical 방식으로 동작합니다.
           </p>
+          <ModelChoices role="radiogroup" aria-label="임베딩 모델 후보">
+            {recommendations.map((item) => (
+              <ModelChoice key={item.id} $selected={selectedModel === item.id}>
+                <input
+                  type="radio"
+                  name="embedding-model"
+                  checked={selectedModel === item.id}
+                  onChange={() => setSelectedModel(item.id)}
+                />
+                <span>
+                  {item.recommended && <Pill $tone="brand">추천</Pill>}
+                  <strong>{item.label}</strong>
+                  <span className="model-name">{item.id}</span>
+                  <span className="model-copy">{item.reason}</span>
+                  <span className="model-tradeoff">확인할 점: {item.tradeoff}</span>
+                </span>
+              </ModelChoice>
+            ))}
+          </ModelChoices>
           <div style={{ marginTop: 22 }}>
             <Field>
               지식 공간 이름
@@ -216,7 +299,7 @@ export function RagCreatePage() {
             <Button $variant="secondary" onClick={() => setStep(1)}>
               이전
             </Button>
-            <Button onClick={create} disabled={saving}>
+            <Button onClick={create} disabled={saving || !selectedModel || !name.trim()}>
               {saving ? '만드는 중…' : '문서 올리기 →'}
             </Button>
           </div>

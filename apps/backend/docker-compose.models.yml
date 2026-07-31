@@ -1,0 +1,31 @@
+services:
+  embedding-bge-m3:
+    image: ${TEI_IMAGE:-ghcr.io/huggingface/text-embeddings-inference:cpu-1.9}
+    profiles: ["bge"]
+    ports: ["8081:80"]
+    command: --model-id BAAI/bge-m3
+    volumes: ["hf-model-cache:/data"]
+
+  embedding-qwen3-0-6b:
+    image: ${TEI_IMAGE:-ghcr.io/huggingface/text-embeddings-inference:cpu-1.9}
+    profiles: ["qwen"]
+    ports: ["8082:80"]
+    command: --model-id Qwen/Qwen3-Embedding-0.6B
+    volumes: ["hf-model-cache:/data"]
+
+  embedding-gemma-300m:
+    image: ${TEI_IMAGE:-ghcr.io/huggingface/text-embeddings-inference:cpu-1.9}
+    profiles: ["gemma"]
+    ports: ["8083:80"]
+    command: --model-id google/embeddinggemma-300m
+    volumes: ["hf-model-cache:/data"]
+
+  reranker-bge-m3:
+    image: ${TEI_IMAGE:-ghcr.io/huggingface/text-embeddings-inference:cpu-1.9}
+    profiles: ["reranker"]
+    ports: ["8084:80"]
+    command: --model-id BAAI/bge-reranker-v2-m3
+    volumes: ["hf-model-cache:/data"]
+
+volumes:
+  hf-model-cache:

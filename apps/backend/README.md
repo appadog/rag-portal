@@ -17,17 +17,51 @@ API 문서는 [http://127.0.0.1:8010/docs](http://127.0.0.1:8010/docs), OpenAPI 
 .venv/bin/pytest -q
 ```
 
+## Local model server (recommended development baseline)
+
+The API is designed on the assumption that free, open-weight model services are already running on the development server. The model registry is explicit:
+
+The single source of truth for what is implemented versus what still needs to be provisioned is [Model Runtime Deployment](../../docs/MODEL_RUNTIME_DEPLOYMENT.md). Follow that checklist before declaring a development or production environment model-ready.
+
+| Role | Model | Local TEI profile / port | When selected |
+| --- | --- | --- | --- |
+| Balanced multilingual embedding | `BAAI/bge-m3` | `bge` / 8081 | `BGE-M3` |
+| Lightweight self-hosted embedding | `Qwen/Qwen3-Embedding-0.6B` | `qwen` / 8082 | `Qwen3-Embedding-0.6B` |
+| Small-footprint embedding | `google/embeddinggemma-300m` | `gemma` / 8083 | `EmbeddingGemma-300M` |
+| Cross-encoder reranker | `BAAI/bge-reranker-v2-m3` | `reranker` / 8084 | `hybrid_rerank` |
+| OCR language data | Tesseract `kor` + `eng` | host package | scanned PDF/image |
+
+Download and run only the embedding profile(s) your development server needs, plus the shared reranker:
+
+```bash
+docker compose -f docker-compose.models.yml --profile bge --profile reranker up -d
+```
+
+The first start downloads model weights into the named volume. Copy `.env.example` to `.env`, then run Uvicorn with `--env-file .env` so the API is pointed at the matching local services. TEI exposes `/embed` for embeddings and `/rerank` for a model-backed cross-encoder reranker. [Hugging Face TEI quick tour](https://huggingface.co/docs/text-embeddings-inference/en/quick_tour)
+
+## Optional external integrations
+
+Copy `.env.example` to `.env` and start the API with `uvicorn app.main:app --env-file .env` (or export the same values into its process).
+
+- With `HF_TOKEN`, the worker can use Hugging Face Inference Providers only as a fallback when a local model service is unavailable. Without either service, the API visibly records a local hash-vector fallback for development; it does not claim semantic-quality equivalence.
+- `RAG_QUEUE_BACKEND=redis` plus `REDIS_URL` uses the Redis dispatch adapter. Run `docker compose up -d redis` from this directory for the local Redis service; without it, the durable SQLite state plus local worker backend remains active.
+- PDF, DOCX, and XLSX are parsed from binary upload data. Scanned PDFs and images use PyMuPDF/Pillow + Tesseract OCR. Install the Tesseract executable with Korean and English language packs in the deployment environment; otherwise the job fails with an actionable OCR error that can be retried after installation.
+
 ## API contract
 
 Base URL: `http://127.0.0.1:8010/api/v1`
 
 | Flow | Endpoint | Notes |
 | --- | --- | --- |
-| Dashboard | `GET/POST /rag-instances` | POST creates `SETTING_UP` instance and recommends one fixed embedding model. |
+| Model recommendations | `POST /rag-instances/embedding-recommendations` | Returns three ranked, explainable model candidates before a user chooses one. |
+| Model runtime | `GET /model-runtime` | Lists every parser/OCR/embedding/reranker service, its endpoint, and readiness state. |
+| Execution plan | `GET /rag-instances/{id}/execution-plan` | Resolves the model services required by that instance's selected embedding model, document profiles, and retrieval techniques. |
+| Dashboard | `GET/POST /rag-instances` | POST creates a `SETTING_UP` instance and persists the model selected from the candidate set. |
 | Detail | `GET /rag-instances/{id}` | Includes documents, candidates, final choice. |
 | Add mode choices | `GET /rag-instances/{id}/document-add-options` | Explains whether an existing finalized pipeline can be reused, and lists its eligible source documents. |
 | Upload + process | `POST /rag-instances/{id}/documents` | JSON `documents[]` plus explicit `pipeline_mode`; returns a queued job immediately, then parser/candidate/index preparation proceeds in the background. |
 | Job polling | `GET /rag-jobs/{jobId}` / `GET /rag-instances/{id}/jobs` | State, completed stages, actual progress, retry/cancel availability, and linked artifact. |
+| Job control | `POST /rag-jobs/{jobId}/cancel` / `POST /rag-jobs/{jobId}/retry` | Stops an active preparation at a safe stage boundary or retries a failed/cancelled job with the original input. |
 | Comparison | `POST /rag-instances/{id}/tuning/compare` | Returns 9 (3 chunking × 3 retrieval) answer cards per document with inline citations. Each candidate searches its own prepared chunks. |
 | Vote | `POST /tuning-rounds/{id}/vote` | Multiple candidate IDs allowed. |
 | Status | `GET /rag-instances/{id}/tuning-status?document_ids=id` | `can_finalize` only becomes true for a unique leader. |
@@ -69,8 +103,9 @@ Use `GET /rag-instances/{id}/document-add-options` before showing this choice. `
 
 ## Product behavior captured
 
-- Questionnaire selects one embedding model per RAG instance; GraphRAG is instance-level.
-- Upload automatically parses content, profiles document shape, and creates 3 chunking × 3 retrieval candidates. Each candidate persists its own derived chunks, so structural, semantic, fixed-length, and table strategies are meaningfully comparable.
+- Questionnaire ranks a small embedding-model candidate set; the user selects one model per RAG instance, while GraphRAG remains instance-level.
+- Upload automatically extracts PDF/DOCX/XLSX/text content (and uses OCR for scan/image sources when provisioned), profiles document shape, and creates 3 chunking × 3 retrieval candidates. Each candidate persists its own derived chunks and vector records, so structural, semantic, fixed-length, and table strategies are meaningfully comparable.
+- Candidate generation is bounded to nine comparable options, but is not a fixed template: parser output measures headings, paragraphs, table-like rows, source length, and OCR use. Those measurements select the three chunking strategies and calculate each candidate's chunk size, overlap, section cap, or rows-per-chunk. The API returns the calculation and its human-readable reason in `chunking_analysis`, `chunking_parameters`, and `selection_reason`.
 - Comparison gives answer-first cards with evidence; missing evidence refuses to fabricate an answer.
 - Multi-select vote accumulates counts. A tie cannot finalize.
 - Finalization retains only the winner per document. Search follows citations and supports a three-level sensitivity setting.
@@ -82,5 +117,5 @@ Use `GET /rag-instances/{id}/document-add-options` before showing this choice. `
 ## Intentional MVP boundaries
 
 - SQLite snapshot persistence is local-process durability, not a multi-worker production database.
-- The local worker uses deterministic text parsing, candidate-specific chunking, and lexical retrieval; replace it with a managed queue and provider-backed embedding/vector pipeline without changing the HTTP shape.
-- Retrieval is lexical mock scoring rather than embeddings. `embedding_model` is still persisted at instance scope to enforce the production invariant.
+- The local worker uses pypdf/python-docx/openpyxl extraction, optional PyMuPDF/Tesseract OCR, candidate-specific chunking, a persisted vector index, BM25, dense, hybrid, and hybrid-rerank scoring. Its primary embedding/rerank path is a local TEI service with downloaded open models; Hugging Face provider access is only an optional fallback.
+- A production deployment still needs a provisioned Redis/SQS service, object storage, provider credentials, and a model-backed reranker. The local fallback deliberately marks itself as a development baseline rather than a semantic or cross-encoder quality claim.
