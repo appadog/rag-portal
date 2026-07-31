@@ -32,4 +32,4 @@ npm run build
 npm test
 ```
 
-Known MVP limits: upload uses JSON text content while production will move to object storage; the local worker uses deterministic lexical retrieval rather than provider-backed embeddings/LLM generation; job cancel/retry remains a future worker capability.
+Known MVP limits: binary uploads currently travel as JSON base64 and should move to object storage in production; the local fallback is deliberately labelled when TEI embedding/reranker services are not provisioned; SQLite snapshot persistence is not a multi-worker production database. Job cancel/retry is implemented at safe processing-stage boundaries.
