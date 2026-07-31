@@ -3,6 +3,8 @@ import type {
   ComparisonRound,
   CreateRagInput,
   EmbeddingModelRecommendation,
+  ExecutionPlan,
+  ModelServiceStatus,
   PipelineCandidate,
   RagDocument,
   RagInstance,
@@ -113,6 +115,49 @@ function jobFromWire(job: Json | undefined): RagProcessingJob | undefined {
   };
 }
 
+function serviceFromWire(service: Json): ModelServiceStatus {
+  return {
+    key: String(service.key),
+    technique: String(service.technique),
+    modelId: String(service.model_id),
+    runtime: String(service.runtime),
+    status: String(service.status),
+    ready: Boolean(service.ready),
+    detail: String(service.detail ?? '모델 서비스 상태를 확인할 수 없어요.'),
+  };
+}
+
+function planFromWire(plan: Json): ExecutionPlan {
+  return {
+    embeddingModel: String(plan.embedding_model),
+    ready: Boolean(plan.ready),
+    fallbackPolicy: String(plan.fallback_policy ?? ''),
+    requiredServices: ((plan.required_services as Json[] | undefined) ?? []).map(serviceFromWire),
+  };
+}
+
+function runtimeFromWire(metadata: Json | undefined, candidate: Json | undefined) {
+  const index = (candidate?.index as Json | undefined) ?? {};
+  const provider =
+    typeof metadata?.provider === 'string'
+      ? metadata.provider
+      : typeof index.embedding_provider === 'string'
+        ? index.embedding_provider
+        : undefined;
+  const warning =
+    typeof metadata?.warning === 'string'
+      ? metadata.warning
+      : typeof index.warning === 'string'
+        ? index.warning
+        : undefined;
+  return {
+    provider,
+    warning,
+    fallback:
+      Boolean(warning) || provider === 'legacy-lexical' || provider === 'development-fallback',
+  };
+}
+
 function pipelineFromWire(candidate: Json, result?: Json): PipelineCandidate {
   const citations = (result?.citations as Json[] | undefined) ?? [];
   const hasEvidence = citations.length > 0;
@@ -136,6 +181,7 @@ function pipelineFromWire(candidate: Json, result?: Json): PipelineCandidate {
       page: locationLabel(citation.location, citation.ordinal),
       navigateUrl: typeof citation.navigate_url === 'string' ? citation.navigate_url : undefined,
     })),
+    runtime: runtimeFromWire(result?.retrieval_metadata as Json | undefined, candidate),
   };
 }
 function instanceFromWire(item: Json, detail = false): RagInstanceDetail {
@@ -244,6 +290,48 @@ function fallbackRecommendations(
 }
 
 export const ragApi = {
+  async modelRuntime(): Promise<ModelServiceStatus[]> {
+    try {
+      const data = await request<{ services?: Json[]; items?: Json[] }>('/api/v1/model-runtime');
+      return (data.services ?? data.items ?? []).map(serviceFromWire);
+    } catch {
+      await wait();
+      return [
+        {
+          key: 'development-fallback',
+          technique: 'embedding',
+          modelId: '로컬 개발 fallback',
+          runtime: 'development',
+          status: 'NOT_CONFIGURED',
+          ready: false,
+          detail: '실제 임베딩 모델이 연결되지 않아 개발용 검색 fallback으로 결과를 표시합니다.',
+        },
+      ];
+    }
+  },
+  async executionPlan(id: string): Promise<ExecutionPlan> {
+    try {
+      return planFromWire(await request<Json>(`/api/v1/rag-instances/${id}/execution-plan`));
+    } catch {
+      await wait();
+      return {
+        embeddingModel: 'BGE-M3',
+        ready: false,
+        fallbackPolicy: '개발 환경에서는 fallback이 기록됩니다.',
+        requiredServices: [
+          {
+            key: 'development-fallback',
+            technique: 'embedding',
+            modelId: '로컬 개발 fallback',
+            runtime: 'development',
+            status: 'NOT_CONFIGURED',
+            ready: false,
+            detail: '실제 모델 서비스가 연결되지 않았습니다.',
+          },
+        ],
+      };
+    }
+  },
   async recommendEmbeddingModels(
     questionnaire: CreateRagInput['questionnaire'],
   ): Promise<EmbeddingModelRecommendation[]> {
@@ -422,6 +510,8 @@ export const ragApi = {
             typeof citation.navigate_url === 'string' ? citation.navigate_url : undefined,
         })),
         latencyMs: 0,
+        artifactId: String((data.artifact as Json | undefined)?.id ?? '') || undefined,
+        runtime: runtimeFromWire(data.retrieval_metadata as Json | undefined, undefined),
       };
     } catch {
       await wait(400);
@@ -431,6 +521,11 @@ export const ragApi = {
           : '해외 출장 식비는 국가 등급에 따라 하루 80~150달러입니다.',
         citations: mockRound.candidates[1].evidence,
         latencyMs: 1240,
+        runtime: {
+          provider: 'development-fallback',
+          warning: '실제 모델 서비스가 연결되지 않아 개발용 검색 결과입니다.',
+          fallback: true,
+        },
       };
     }
   },
@@ -489,8 +584,22 @@ export const ragApi = {
           // Keep waiting for a valid terminal event instead of replacing existing content.
         }
       });
-      source.addEventListener('done', () =>
-        finish(() => resolve({ text, citations, latencyMs: Date.now() - startedAt })),
+      source.addEventListener('done', (event) =>
+        finish(() => {
+          let metadata: Json = {};
+          try {
+            metadata = JSON.parse((event as MessageEvent<string>).data) as Json;
+          } catch {
+            /* terminal text is still usable */
+          }
+          resolve({
+            text,
+            citations,
+            latencyMs: Date.now() - startedAt,
+            artifactId: String(metadata.artifact_id ?? '') || undefined,
+            runtime: runtimeFromWire(metadata.retrieval_metadata as Json | undefined, undefined),
+          });
+        }),
       );
       source.onerror = () =>
         finish(() =>
@@ -502,11 +611,20 @@ export const ragApi = {
       else options.signal?.addEventListener('abort', abort, { once: true });
     });
   },
-  async feedback(id: string, rating: 1 | -1): Promise<void> {
+  async feedback(
+    id: string,
+    rating: 1 | -1,
+    context?: { artifactId?: string; documentIds?: string[]; citationIds?: string[] },
+  ): Promise<void> {
     try {
       await request(`/api/v1/rag-instances/${id}/feedback`, {
         method: 'POST',
-        body: JSON.stringify({ rating }),
+        body: JSON.stringify({
+          rating,
+          artifact_id: context?.artifactId,
+          document_ids: context?.documentIds,
+          citation_ids: context?.citationIds,
+        }),
       });
     } catch {
       await wait();

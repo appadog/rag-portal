@@ -1,6 +1,8 @@
 import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
+import { afterEach, beforeEach, vi } from 'vitest';
+import { ragApi } from '../../shared/api/client';
 import { RagDetailPage } from './RagDetailWorkspace';
 
 function renderWorkspace() {
@@ -14,6 +16,10 @@ function renderWorkspace() {
 }
 
 describe('RagDetailPage workspace', () => {
+  beforeEach(() => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1440 });
+  });
+  afterEach(() => vi.restoreAllMocks());
   it('starts mobile in single Work mode and swaps side panels', async () => {
     const user = userEvent.setup();
     Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
@@ -78,5 +84,53 @@ describe('RagDetailPage workspace', () => {
     expect(screen.getByText(/관련성과 범위의 균형/)).toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: '엄격하게' }));
     expect(screen.getByText(/문서에 더 직접적으로 적힌 내용/)).toBeInTheDocument();
+  });
+
+  it('locks the document scope while a search is in progress and records that request scope', async () => {
+    const user = userEvent.setup();
+    let resolveSearch:
+      | ((answer: Awaited<ReturnType<typeof ragApi.streamAnswer>>) => void)
+      | undefined;
+    const streamAnswer = vi.spyOn(ragApi, 'streamAnswer').mockImplementation(
+      (_id, _question, documentIds, sensitivity) =>
+        new Promise((resolve) => {
+          expect(documentIds).toEqual(['travel-policy', 'benefits']);
+          expect(sensitivity).toBe('balanced');
+          resolveSearch = resolve;
+        }),
+    );
+    renderWorkspace();
+    const question = await screen.findByRole('textbox', { name: '검색 질문' });
+    await user.type(question, '국내 출장 숙박비는 얼마까지 되나요?');
+    await user.click(screen.getByRole('button', { name: '질문하기' }));
+
+    const documentToggle = screen.getByRole('checkbox', { name: /출장비_지급_규정.pdf/ });
+    expect(documentToggle).toBeDisabled();
+    expect(
+      await screen.findByText(/검색 범위: 출장비_지급_규정.pdf, 복리후생_안내.pdf · 평이하게/),
+    ).toBeInTheDocument();
+    expect(streamAnswer).toHaveBeenCalledTimes(1);
+
+    resolveSearch?.({ text: '검색 결과', citations: [], latencyMs: 1 });
+    await waitFor(() =>
+      expect(screen.queryByRole('button', { name: '중단' })).not.toBeInTheDocument(),
+    );
+  });
+
+  it('connects Output tabs to a tabpanel and supports roving Arrow navigation', async () => {
+    const user = userEvent.setup();
+    renderWorkspace();
+    const settings = await screen.findByRole('tab', { name: '설정' });
+    expect(settings).toHaveAttribute('aria-controls', 'rag-travel-output-panel-settings');
+    settings.focus();
+    await user.keyboard('{ArrowRight}');
+
+    const documents = screen.getByRole('tab', { name: '문서' });
+    await waitFor(() => expect(documents).toHaveAttribute('aria-selected', 'true'));
+    expect(documents).toHaveFocus();
+    expect(screen.getByRole('tabpanel')).toHaveAttribute(
+      'aria-labelledby',
+      'rag-travel-output-tab-documents',
+    );
   });
 });

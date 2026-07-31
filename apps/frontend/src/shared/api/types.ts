@@ -59,6 +59,34 @@ export interface PipelineCandidate {
   latencyMs: number;
   answer: string;
   evidence: { id: string; title: string; excerpt: string; page: string; navigateUrl?: string }[];
+  runtime?: {
+    provider?: string;
+    warning?: string;
+    fallback: boolean;
+  };
+}
+
+export interface ModelServiceStatus {
+  key: string;
+  technique: string;
+  modelId: string;
+  runtime: string;
+  status: 'READY' | 'NOT_CONFIGURED' | 'UNAVAILABLE' | 'NOT_INSTALLED' | string;
+  ready: boolean;
+  detail: string;
+}
+
+export interface ExecutionPlan {
+  embeddingModel: string;
+  ready: boolean;
+  fallbackPolicy: string;
+  requiredServices: ModelServiceStatus[];
+}
+
+export interface SearchContextSnapshot {
+  documentIds: string[];
+  documentNames: string[];
+  sensitivity: string;
 }
 
 export interface ComparisonRound {
@@ -96,4 +124,11 @@ export interface ChatAnswer {
   text: string;
   citations: { id: string; title: string; excerpt: string; page: string; navigateUrl?: string }[];
   latencyMs: number;
+  context?: SearchContextSnapshot;
+  artifactId?: string;
+  runtime?: {
+    provider?: string;
+    warning?: string;
+    fallback: boolean;
+  };
 }

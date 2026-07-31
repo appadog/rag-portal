@@ -1674,7 +1674,7 @@ def search(instance_id: str, body: SearchRequest) -> dict:
         payload={"question": body.question, "answer": answer["answer"], "citations": citations},
     )
     persist_state()
-    return {"question": body.question, "retrieval_config": retrieval, "sensitivity": body.sensitivity, "answer": answer["answer"], "citations": citations, "grounded": answer["grounded"], "relevance": answer["relevance"], "artifact": artifact_payload(artifact)}
+    return {"question": body.question, "retrieval_config": retrieval, "sensitivity": body.sensitivity, "answer": answer["answer"], "citations": citations, "grounded": answer["grounded"], "relevance": answer["relevance"], "retrieval_metadata": answer.get("retrieval_metadata", {}), "artifact": artifact_payload(artifact)}
 
 
 @app.get(f"{API_PREFIX}/rag-instances/{{instance_id}}/search/stream")
@@ -1685,7 +1685,7 @@ async def search_stream(instance_id: str, question: str, document_ids: list[str]
         yield f"event: citations\ndata: {json.dumps(result['citations'], ensure_ascii=False)}\n\n"
         for token in result["answer"].split(" "):
             yield f"event: token\ndata: {json.dumps({'token': token + ' '}, ensure_ascii=False)}\n\n"
-        yield f"event: done\ndata: {json.dumps({'grounded': result['grounded'], 'relevance': result['relevance']})}\n\n"
+        yield f"event: done\ndata: {json.dumps({'grounded': result['grounded'], 'relevance': result['relevance'], 'retrieval_metadata': result.get('retrieval_metadata', {}), 'artifact_id': result.get('artifact', {}).get('id')})}\n\n"
 
     return StreamingResponse(events(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 

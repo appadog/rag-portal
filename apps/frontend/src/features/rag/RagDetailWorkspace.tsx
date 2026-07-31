@@ -2,7 +2,14 @@ import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent }
 import { useNavigate, useParams } from 'react-router-dom';
 import styled, { css } from 'styled-components';
 import { ragApi } from '../../shared/api/client';
-import type { ChatAnswer, PipelineCandidate, RagInstanceDetail } from '../../shared/api/types';
+import type {
+  ChatAnswer,
+  ExecutionPlan,
+  ModelServiceStatus,
+  PipelineCandidate,
+  RagInstanceDetail,
+  SearchContextSnapshot,
+} from '../../shared/api/types';
 import {
   Button,
   Card,
@@ -18,6 +25,7 @@ type PanelName = 'context' | 'output';
 type OutputView = 'evidence' | 'settings' | 'documents';
 type StreamingAnswer = Pick<ChatAnswer, 'text' | 'citations'> & {
   question: string;
+  context: SearchContextSnapshot;
   state: 'streaming' | 'interrupted' | 'failed';
 };
 
@@ -25,6 +33,11 @@ const sensitivityDescriptions: Record<string, string> = {
   flexible: '유연하게: 표현이 조금 달라도 관련된 내용을 넓게 찾아봐요.',
   balanced: '평이하게: 관련성과 범위의 균형을 맞춰 답을 찾아요.',
   strict: '엄격하게: 문서에 더 직접적으로 적힌 내용만 우선해요.',
+};
+const sensitivityLabels: Record<string, string> = {
+  flexible: '유연하게',
+  balanced: '평이하게',
+  strict: '엄격하게',
 };
 
 const DetailPage = styled.div`
@@ -105,23 +118,32 @@ const Workspace = styled.main`
     font-weight: var(--rp-weight-bold);
   }
   @media (max-width: 1380px) {
-    min-height: calc(100dvh - 11rem);
-    flex: 0 0 auto;
-    grid-template-columns: minmax(14rem, 17rem) minmax(0, 1fr);
+    grid-template-columns: minmax(15rem, 17rem) minmax(0, 1fr);
     .output {
-      grid-column: 1/-1;
-      min-height: 20rem;
+      position: fixed;
+      z-index: 20;
+      inset: 0 0 0 auto;
+      width: min(26rem, 92vw);
+      min-height: 100dvh;
+      border-radius: 0;
     }
     .output[data-open='false'] {
       display: none;
     }
   }
-  @media (max-width: 720px) {
+  @media (max-width: 1023px) {
     grid-template-columns: minmax(0, 1fr);
-    min-height: auto;
     .context,
     .output {
-      grid-column: 1;
+      position: fixed;
+      z-index: 20;
+      inset: 0 auto 0 0;
+      width: min(22rem, 92vw);
+      min-height: 100dvh;
+      border-radius: 0;
+    }
+    .output {
+      inset: 0 0 0 auto;
     }
     .context[data-open='false'],
     .output[data-open='false'] {
@@ -294,6 +316,12 @@ const WorkBody = styled.section`
     color: var(--rp-status-warning);
     font-size: var(--rp-font-size-12);
   }
+  .feedback-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--rp-space-2);
+    margin-top: var(--rp-space-3);
+  }
 `;
 const CitationButton = styled.button`
   min-width: 1.5rem;
@@ -460,6 +488,8 @@ export function RagDetailPage() {
   const { id = '' } = useParams();
   const navigate = useNavigate();
   const [detail, setDetail] = useState<RagInstanceDetail>();
+  const [executionPlan, setExecutionPlan] = useState<ExecutionPlan>();
+  const [modelRuntime, setModelRuntime] = useState<ModelServiceStatus[]>([]);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [answer, setAnswer] = useState<ChatAnswer>();
   const [lastQuestion, setLastQuestion] = useState('');
@@ -480,15 +510,25 @@ export function RagDetailPage() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>();
   const [queryError, setQueryError] = useState<string>();
+  const [failedSearch, setFailedSearch] = useState<{
+    question: string;
+    context: SearchContextSnapshot;
+    stopped?: boolean;
+  }>();
+  const [evidenceLoadError, setEvidenceLoadError] = useState<string>();
+  const [feedback, setFeedback] = useState<1 | -1>();
   const evidenceHeadingRef = useRef<HTMLHeadingElement | null>(null);
   const evidenceTriggerRef = useRef<HTMLButtonElement | null>(null);
   const dialogRef = useRef<HTMLDivElement | null>(null);
+  const dialogTriggerRef = useRef<HTMLElement | null>(null);
+  const panelTriggerRefs = useRef<Partial<Record<PanelName, HTMLButtonElement>>>({});
   const answerAbortRef = useRef<AbortController>();
   const load = () =>
-    ragApi
-      .get(id)
-      .then((item) => {
+    Promise.all([ragApi.get(id), ragApi.executionPlan(id), ragApi.modelRuntime()])
+      .then(([item, plan, runtime]) => {
         setDetail(item);
+        setExecutionPlan(plan);
+        setModelRuntime(runtime);
         setSelectedIds((prior) =>
           prior.length
             ? prior.filter((value) => item.documents.some((document) => document.id === value))
@@ -501,6 +541,14 @@ export function RagDetailPage() {
   useEffect(() => {
     load();
   }, [id]);
+  const [viewportWidth, setViewportWidth] = useState(() =>
+    typeof window === 'undefined' ? 1440 : window.innerWidth,
+  );
+  useEffect(() => {
+    const updateViewport = () => setViewportWidth(window.innerWidth);
+    window.addEventListener('resize', updateViewport);
+    return () => window.removeEventListener('resize', updateViewport);
+  }, []);
   useEffect(() => {
     if (evidence) {
       setView('evidence');
@@ -509,15 +557,24 @@ export function RagDetailPage() {
   }, [evidence]);
   useEffect(() => {
     const close = (event: KeyboardEvent) => {
-      if (event.key === 'Escape' && evidence) {
+      if (event.key === 'Escape' && evidence && !evidenceLoadError) {
         setEvidence(undefined);
         evidenceTriggerRef.current?.focus();
       }
-      if (event.key === 'Escape' && dialog) setDialog(undefined);
+      if (event.key === 'Escape' && dialog) closeDialog();
+      if (event.key === 'Escape' && !dialog && !evidence && viewportWidth < 1440) {
+        if (open.output) {
+          setOpen((state) => ({ ...state, output: false }));
+          panelTriggerRefs.current.output?.focus();
+        } else if (open.context && viewportWidth < 1024) {
+          setOpen((state) => ({ ...state, context: false }));
+          panelTriggerRefs.current.context?.focus();
+        }
+      }
     };
     window.addEventListener('keydown', close);
     return () => window.removeEventListener('keydown', close);
-  }, [evidence, dialog]);
+  }, [evidence, dialog, evidenceLoadError, open.context, open.output, viewportWidth]);
   useEffect(() => {
     if (dialog) window.setTimeout(() => focusable(dialogRef.current)?.focus(), 0);
   }, [dialog]);
@@ -530,10 +587,12 @@ export function RagDetailPage() {
   }, [detail?.latestJob?.id, detail?.latestJob?.state]);
   if (error) return <ErrorState message={error} retry={load} />;
   if (!detail) return <LoadingState label="지식 공간과 문서를 불러오고 있어요…" />;
-  const toggleDocument = (documentId: string) =>
+  const toggleDocument = (documentId: string) => {
+    if (busy) return;
     setSelectedIds((ids) =>
       ids.includes(documentId) ? ids.filter((item) => item !== documentId) : [...ids, documentId],
     );
+  };
   const togglePanel = (panel: PanelName) =>
     setOpen((state) => {
       const nextOpen = !state[panel];
@@ -557,39 +616,77 @@ export function RagDetailPage() {
     : !draft.trim()
       ? '질문을 입력하면 검색할 수 있어요.'
       : busy
-        ? '답을 찾고 있어요.'
+        ? '검색 결과와 근거를 준비하고 있어요.'
         : '';
-  const ask = async (question = draft) => {
-    if (searchDisabled) return;
+  const ask = async (question = draft, contextOverride?: SearchContextSnapshot) => {
+    if (busy || !question.trim()) return;
+    const context = contextOverride ?? {
+      documentIds: [...selectedIds],
+      documentNames: detail.documents
+        .filter((document) => selectedIds.includes(document.id))
+        .map((document) => document.name),
+      sensitivity,
+    };
+    if (!context.documentIds.length) return;
     const controller = new AbortController();
     answerAbortRef.current = controller;
     setBusy(true);
     setQueryError(undefined);
-    setStreamingAnswer({ question, text: '', citations: [], state: 'streaming' });
+    setFailedSearch(undefined);
+    setStreamingAnswer({ question, text: '', citations: [], context, state: 'streaming' });
     try {
-      const nextAnswer = await ragApi.streamAnswer(id, question, selectedIds, sensitivity, {
-        signal: controller.signal,
-        onUpdate: (partial) =>
-          setStreamingAnswer((current) =>
-            current ? { ...current, ...partial, state: 'streaming' } : current,
-          ),
-      });
+      const nextAnswer = await ragApi.streamAnswer(
+        id,
+        question,
+        context.documentIds,
+        context.sensitivity,
+        {
+          signal: controller.signal,
+          onUpdate: (partial) =>
+            setStreamingAnswer((current) =>
+              current ? { ...current, ...partial, state: 'streaming' } : current,
+            ),
+        },
+      );
       if (controller.signal.aborted) return;
-      setAnswer(nextAnswer);
+      setAnswer({ ...nextAnswer, context });
       setLastQuestion(question);
+      setFeedback(undefined);
       setStreamingAnswer(undefined);
     } catch (item) {
       if ((item as Error).name === 'AbortError') {
         setStreamingAnswer((current) => (current ? { ...current, state: 'interrupted' } : current));
+        setFailedSearch({ question, context, stopped: true });
       } else {
         setQueryError((item as Error).message);
         setStreamingAnswer((current) => (current ? { ...current, state: 'failed' } : current));
+        setFailedSearch({ question, context });
       }
     } finally {
       if (answerAbortRef.current === controller) setBusy(false);
     }
   };
   const stopAnswer = () => answerAbortRef.current?.abort();
+  const contextSummary = (context: SearchContextSnapshot) =>
+    `${context.documentNames.join(', ') || '선택한 문서'} · ${sensitivityLabels[context.sensitivity] ?? context.sensitivity}`;
+  const leaveFeedback = async (rating: 1 | -1) => {
+    if (!answer) return;
+    setFeedback(rating);
+    await ragApi.feedback(id, rating, {
+      artifactId: answer.artifactId,
+      documentIds: answer.context?.documentIds,
+      citationIds: answer.citations.map((citation) => citation.id),
+    });
+  };
+  const closeDialog = () => {
+    setDialog(undefined);
+    window.setTimeout(() => dialogTriggerRef.current?.focus(), 0);
+  };
+  const openDialog = (kind: 'add' | 'delete', trigger: HTMLElement, documentId?: string) => {
+    dialogTriggerRef.current = trigger;
+    if (documentId) setTargetId(documentId);
+    setDialog(kind);
+  };
   function citationButton(citation: ChatAnswer['citations'][number], index: number) {
     return (
       <CitationButton
@@ -623,6 +720,7 @@ export function RagDetailPage() {
     evidenceTriggerRef.current = trigger;
     showPanel('output');
     setEvidence(candidate);
+    setEvidenceLoadError(undefined);
     const navigateUrl = candidate.evidence[0]?.navigateUrl;
     if (navigateUrl) {
       try {
@@ -631,7 +729,7 @@ export function RagDetailPage() {
           current ? { ...current, evidence: [{ ...current.evidence[0], ...source }] } : current,
         );
       } catch (item) {
-        setError((item as Error).message);
+        setEvidenceLoadError((item as Error).message);
       }
     }
   };
@@ -663,6 +761,9 @@ export function RagDetailPage() {
     }
   };
   const readyDocuments = detail.documents.filter((document) => document.pipelineId);
+  const outputIsDrawer = viewportWidth < 1440;
+  const contextIsDrawer = viewportWidth < 1024;
+  const panelId = (panel: PanelName) => `rag-${id}-${panel}-panel`;
   return (
     <DetailPage>
       <Header>
@@ -680,17 +781,27 @@ export function RagDetailPage() {
         </div>
         <div className="tools">
           <IconButton
+            ref={(node) => {
+              panelTriggerRefs.current.context = node ?? undefined;
+            }}
             $active={open.context}
             aria-label="문서 컨텍스트 패널 표시 전환"
+            aria-expanded={open.context}
             aria-pressed={open.context}
+            aria-controls={panelId('context')}
             onClick={() => togglePanel('context')}
           >
             문서
           </IconButton>
           <IconButton
+            ref={(node) => {
+              panelTriggerRefs.current.output = node ?? undefined;
+            }}
             $active={open.output}
             aria-label="결과 및 근거 패널 표시 전환"
+            aria-expanded={open.output}
             aria-pressed={open.output}
+            aria-controls={panelId('output')}
             onClick={() => togglePanel('output')}
           >
             근거
@@ -698,7 +809,15 @@ export function RagDetailPage() {
         </div>
       </Header>
       <Workspace aria-label="RAG 검색 작업 공간">
-        <section className="panel context" data-open={open.context} aria-label="문서 컨텍스트">
+        <section
+          id={panelId('context')}
+          className="panel context"
+          data-open={open.context}
+          aria-label="문서 컨텍스트"
+          role={contextIsDrawer && open.context ? 'dialog' : undefined}
+          aria-modal={contextIsDrawer && open.context ? true : undefined}
+          onKeyDown={contextIsDrawer && open.context ? trapTab : undefined}
+        >
           <div className="panel-head">
             <span>Context · 문서 범위</span>
             <span>
@@ -716,7 +835,7 @@ export function RagDetailPage() {
                     id={`doc-${document.id}`}
                     type="checkbox"
                     checked={selectedIds.includes(document.id)}
-                    disabled={!document.pipelineId}
+                    disabled={busy || !document.pipelineId}
                     onChange={() => toggleDocument(document.id)}
                     aria-describedby={`doc-meta-${document.id}`}
                   />
@@ -742,7 +861,11 @@ export function RagDetailPage() {
                 아직 문서가 없어요. 문서를 추가하면 준비 상태를 여기서 확인할 수 있어요.
               </p>
             )}
-            <Button className="add" $variant="secondary" onClick={() => setDialog('add')}>
+            <Button
+              className="add"
+              $variant="secondary"
+              onClick={(event) => openDialog('add', event.currentTarget)}
+            >
               + 문서 추가
             </Button>
           </ContextBody>
@@ -752,7 +875,7 @@ export function RagDetailPage() {
             <span>Work · 검색</span>
             <span role="status" aria-live="polite">
               {busy
-                ? '답을 찾고 있어요…'
+                ? '검색 결과와 근거를 준비하고 있어요…'
                 : selectedIds.length
                   ? `${selectedIds.length}개 문서 선택됨`
                   : '문서를 선택해 주세요'}
@@ -775,6 +898,39 @@ export function RagDetailPage() {
                         ? `근거 ${answer.citations.length}개 · 응답 ${(answer.latencyMs / 1000).toFixed(1)}초`
                         : '근거 부족 · 검색 범위 또는 질문을 바꿔 보세요.'}
                     </div>
+                    {answer.context && (
+                      <div className="answer-meta">검색 범위: {contextSummary(answer.context)}</div>
+                    )}
+                    {answer.runtime?.fallback && (
+                      <div className="answer-meta" role="status">
+                        개발용 fallback 검색 결과 ·{' '}
+                        {answer.runtime.warning ?? answer.runtime.provider}
+                      </div>
+                    )}
+                    <div className="feedback-actions" aria-label="검색 결과 피드백">
+                      <Button
+                        $variant="ghost"
+                        onClick={() => void leaveFeedback(1)}
+                        aria-pressed={feedback === 1}
+                      >
+                        도움돼요
+                      </Button>
+                      <Button
+                        $variant="ghost"
+                        onClick={() => void leaveFeedback(-1)}
+                        aria-pressed={feedback === -1}
+                      >
+                        개선 필요
+                      </Button>
+                      {answer.context && (
+                        <Button
+                          $variant="ghost"
+                          onClick={() => void ask(lastQuestion, answer.context)}
+                        >
+                          같은 조건으로 다시 검색
+                        </Button>
+                      )}
+                    </div>
                   </div>
                 </>
               ) : !streamingAnswer ? (
@@ -790,11 +946,14 @@ export function RagDetailPage() {
                     {streamingAnswer.citations.map(citationButton)}
                     <p className="stream-status" role="status">
                       {streamingAnswer.state === 'streaming'
-                        ? '답변을 만드는 중이에요. 필요하면 중단할 수 있어요.'
+                        ? '검색 결과와 근거를 준비하고 있어요. 필요하면 중단할 수 있어요.'
                         : streamingAnswer.state === 'interrupted'
-                          ? '답변 생성을 중단했어요. 지금까지 받은 내용은 남아 있어요.'
-                          : '답변 연결이 끊겼어요. 지금까지 받은 내용을 확인하거나 다시 질문해 주세요.'}
+                          ? '검색 결과 표시를 중단했어요. 답변 생성을 중단했어요. 지금까지 받은 내용은 남아 있어요.'
+                          : '검색 결과 연결이 끊겼어요. 지금까지 받은 내용을 확인하거나 다시 질문해 주세요.'}
                     </p>
+                    <div className="answer-meta">
+                      검색 범위: {contextSummary(streamingAnswer.context)}
+                    </div>
                   </div>
                 </>
               )}
@@ -850,9 +1009,39 @@ export function RagDetailPage() {
                 )}
               </div>
               {queryError && (
-                <p className="reason" role="alert">
-                  {queryError}
-                </p>
+                <div className="reason" role="alert">
+                  <p>{queryError}</p>
+                  {failedSearch && !failedSearch.stopped && (
+                    <Button
+                      $variant="secondary"
+                      onClick={() => void ask(failedSearch.question, failedSearch.context)}
+                    >
+                      같은 조건으로 다시 시도
+                    </Button>
+                  )}
+                  {failedSearch && (
+                    <Button
+                      $variant="ghost"
+                      onClick={() => {
+                        setDraft(failedSearch.question);
+                        setQueryError(undefined);
+                      }}
+                    >
+                      질문 수정하기
+                    </Button>
+                  )}
+                </div>
+              )}
+              {failedSearch?.stopped && !queryError && (
+                <div className="reason" role="status">
+                  <p>이 질문을 같은 문서 범위로 다시 검색할 수 있어요.</p>
+                  <Button
+                    $variant="secondary"
+                    onClick={() => void ask(failedSearch.question, failedSearch.context)}
+                  >
+                    이 질문 다시 보내기
+                  </Button>
+                </div>
               )}
               {disabledReason && (
                 <p className="reason" id="composer-reason">
@@ -862,7 +1051,15 @@ export function RagDetailPage() {
             </div>
           </WorkBody>
         </section>
-        <section className="panel output" data-open={open.output} aria-label="결과 및 근거">
+        <section
+          id={panelId('output')}
+          className="panel output"
+          data-open={open.output}
+          aria-label="결과 및 근거"
+          role={outputIsDrawer && open.output ? 'dialog' : undefined}
+          aria-modal={outputIsDrawer && open.output ? true : undefined}
+          onKeyDown={outputIsDrawer && open.output ? trapTab : undefined}
+        >
           <div className="panel-head">
             <span>
               Output · {view === 'evidence' ? '근거' : view === 'documents' ? '문서 관리' : '설정'}
@@ -873,102 +1070,159 @@ export function RagDetailPage() {
           </div>
           <OutputBody aria-label={evidence ? '문서 근거' : undefined}>
             <div className="output-tabs" role="tablist" aria-label="결과 패널 보기">
-              <button
-                role="tab"
-                aria-selected={view === 'evidence'}
-                onClick={() => setView('evidence')}
-              >
-                근거
-              </button>
-              <button
-                role="tab"
-                aria-selected={view === 'settings'}
-                onClick={() => setView('settings')}
-              >
-                설정
-              </button>
-              <button
-                role="tab"
-                aria-selected={view === 'documents'}
-                onClick={() => setView('documents')}
-              >
-                문서
-              </button>
-            </div>
-            {view === 'evidence' ? (
-              evidence ? (
-                <>
-                  <Pill $tone="brand">{evidence.evidence[0]?.page}</Pill>
-                  <h2 ref={evidenceHeadingRef} tabIndex={-1}>
-                    {evidence.evidence[0]?.title}
-                  </h2>
-                  <p className="excerpt">{evidence.evidence[0]?.excerpt}</p>
-                  <Button
-                    $variant="ghost"
-                    onClick={() => {
-                      setEvidence(undefined);
-                      evidenceTriggerRef.current?.focus();
+              {(['evidence', 'settings', 'documents'] as OutputView[]).map(
+                (tabView, index, views) => (
+                  <button
+                    key={tabView}
+                    id={`rag-${id}-output-tab-${tabView}`}
+                    role="tab"
+                    aria-selected={view === tabView}
+                    aria-controls={`rag-${id}-output-panel-${tabView}`}
+                    tabIndex={view === tabView ? 0 : -1}
+                    onClick={() => setView(tabView)}
+                    onKeyDown={(event) => {
+                      const direction =
+                        event.key === 'ArrowRight' ? 1 : event.key === 'ArrowLeft' ? -1 : 0;
+                      const nextIndex =
+                        event.key === 'Home'
+                          ? 0
+                          : event.key === 'End'
+                            ? views.length - 1
+                            : (index + direction + views.length) % views.length;
+                      if (direction || event.key === 'Home' || event.key === 'End') {
+                        event.preventDefault();
+                        const nextView = views[nextIndex];
+                        setView(nextView);
+                        window.setTimeout(
+                          () =>
+                            document.getElementById(`rag-${id}-output-tab-${nextView}`)?.focus(),
+                          0,
+                        );
+                      }
                     }}
                   >
-                    근거 닫기
-                  </Button>
-                </>
-              ) : (
-                <>
-                  <h2>근거를 확인하세요</h2>
-                  <p>
-                    답변 속 번호를 누르면 해당 문서 조각이 여기에 열립니다. 근거가 없는 답은 경고로
-                    구분됩니다.
-                  </p>
-                </>
-              )
-            ) : view === 'settings' ? (
-              <>
-                <h2>확정된 설정</h2>
-                <dl className="spec">
-                  <div>
-                    <dt>임베딩 모델</dt>
-                    <dd>{detail.embeddingModel}</dd>
-                  </div>
-                  <div>
-                    <dt>연결형 질문</dt>
-                    <dd>{detail.graphragEnabled ? '사용' : '사용 안 함'}</dd>
-                  </div>
-                  <div>
-                    <dt>검색 방식</dt>
-                    <dd>
-                      {new Set(readyDocuments.map((document) => document.pipelineLabel)).size > 1
-                        ? '일반 검색 (문서별 방식이 다름)'
-                        : (readyDocuments[0]?.pipelineLabel ?? '문서 추가 후 비교 필요')}
-                    </dd>
-                  </div>
-                </dl>
-              </>
-            ) : (
-              <div className="manage">
-                <h2>문서 관리</h2>
-                <p>
-                  새 문서는 기존 방식을 적용하거나, 별도로 비교해 문서에 맞는 방식을 찾을 수 있어요.
-                </p>
-                {detail.documents.map((document) => (
-                  <div className="manage-row" key={document.id}>
-                    <span>{document.name}</span>
+                    {tabView === 'evidence' ? '근거' : tabView === 'settings' ? '설정' : '문서'}
+                  </button>
+                ),
+              )}
+            </div>
+            <div
+              role="tabpanel"
+              id={`rag-${id}-output-panel-${view}`}
+              aria-labelledby={`rag-${id}-output-tab-${view}`}
+              tabIndex={0}
+            >
+              {view === 'evidence' ? (
+                evidence ? (
+                  <>
+                    <Pill $tone="brand">{evidence.evidence[0]?.page}</Pill>
+                    <h2 ref={evidenceHeadingRef} tabIndex={-1}>
+                      {evidence.evidence[0]?.title}
+                    </h2>
+                    <p className="excerpt">{evidence.evidence[0]?.excerpt}</p>
+                    {evidenceLoadError && (
+                      <div className="excerpt" role="alert">
+                        <p>{evidenceLoadError}</p>
+                        <p>원문 전체를 불러오지 못해 인용 미리보기를 보여드려요.</p>
+                        <Button
+                          $variant="secondary"
+                          onClick={() =>
+                            void openEvidence(
+                              evidence,
+                              evidenceTriggerRef.current ?? document.createElement('button'),
+                            )
+                          }
+                        >
+                          근거 다시 불러오기
+                        </Button>
+                      </div>
+                    )}
                     <Button
-                      $variant="danger"
+                      $variant="ghost"
                       onClick={() => {
-                        setTargetId(document.id);
-                        setDialog('delete');
+                        setEvidence(undefined);
+                        evidenceTriggerRef.current?.focus();
                       }}
                     >
-                      삭제
+                      근거 닫기
                     </Button>
-                  </div>
-                ))}
-                <Button $variant="secondary" onClick={() => setDialog('add')}>
-                  문서 추가
-                </Button>
-              </div>
-            )}
+                  </>
+                ) : (
+                  <>
+                    <h2>근거를 확인하세요</h2>
+                    <p>
+                      답변 속 번호를 누르면 해당 문서 조각이 여기에 열립니다. 근거가 없는 답은
+                      경고로 구분됩니다.
+                    </p>
+                  </>
+                )
+              ) : view === 'settings' ? (
+                <>
+                  <h2>확정된 설정</h2>
+                  {!executionPlan?.ready && (
+                    <p className="excerpt" role="status">
+                      실제 모델 서비스가 준비되지 않아 개발용 fallback 검색 결과를 표시할 수 있어요.{' '}
+                      {executionPlan?.fallbackPolicy ||
+                        modelRuntime.find((service) => !service.ready)?.detail}
+                      <Button $variant="ghost" onClick={load}>
+                        모델 상태 새로고침
+                      </Button>
+                    </p>
+                  )}
+                  <dl className="spec">
+                    <div>
+                      <dt>임베딩 모델</dt>
+                      <dd>{detail.embeddingModel}</dd>
+                    </div>
+                    <div>
+                      <dt>연결형 질문</dt>
+                      <dd>{detail.graphragEnabled ? '사용' : '사용 안 함'}</dd>
+                    </div>
+                    <div>
+                      <dt>검색 방식</dt>
+                      <dd>
+                        {new Set(readyDocuments.map((document) => document.pipelineLabel)).size > 1
+                          ? '일반 검색 (문서별 방식이 다름)'
+                          : (readyDocuments[0]?.pipelineLabel ?? '문서 추가 후 비교 필요')}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>실행 상태</dt>
+                      <dd>
+                        {executionPlan?.ready
+                          ? '연결된 모델 서비스 사용'
+                          : '개발용 fallback 가능 · 서비스 설정 필요'}
+                      </dd>
+                    </div>
+                  </dl>
+                </>
+              ) : (
+                <div className="manage">
+                  <h2>문서 관리</h2>
+                  <p>
+                    새 문서는 기존 방식을 적용하거나, 별도로 비교해 문서에 맞는 방식을 찾을 수
+                    있어요.
+                  </p>
+                  {detail.documents.map((document) => (
+                    <div className="manage-row" key={document.id}>
+                      <span>{document.name}</span>
+                      <Button
+                        $variant="danger"
+                        onClick={(event) => openDialog('delete', event.currentTarget, document.id)}
+                      >
+                        삭제
+                      </Button>
+                    </div>
+                  ))}
+                  <Button
+                    $variant="secondary"
+                    onClick={(event) => openDialog('add', event.currentTarget)}
+                  >
+                    문서 추가
+                  </Button>
+                </div>
+              )}
+            </div>
           </OutputBody>
         </section>
       </Workspace>
@@ -976,7 +1230,7 @@ export function RagDetailPage() {
         <DialogOverlay
           role="presentation"
           onMouseDown={(event) => {
-            if (event.target === event.currentTarget) setDialog(undefined);
+            if (event.target === event.currentTarget) closeDialog();
           }}
         >
           <div
@@ -1016,7 +1270,7 @@ export function RagDetailPage() {
                   <p>먼저 추가할 문서를 선택해 주세요.</p>
                 )}
                 <div className="actions">
-                  <Button $variant="secondary" autoFocus onClick={() => setDialog(undefined)}>
+                  <Button $variant="secondary" autoFocus onClick={closeDialog}>
                     취소
                   </Button>
                   <Button onClick={addDocuments} disabled={!files.length || busy}>
@@ -1029,7 +1283,7 @@ export function RagDetailPage() {
                 <h2 id="dialog-title">이 문서를 삭제할까요?</h2>
                 <p>문서와 해당 문서의 검색 설정이 함께 제거됩니다. 이 작업은 되돌릴 수 없습니다.</p>
                 <div className="actions">
-                  <Button $variant="secondary" autoFocus onClick={() => setDialog(undefined)}>
+                  <Button $variant="secondary" autoFocus onClick={closeDialog}>
                     취소
                   </Button>
                   <Button $variant="danger" onClick={deleteDocument} disabled={busy}>

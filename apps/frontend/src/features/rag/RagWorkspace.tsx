@@ -1,4 +1,10 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent as ReactKeyboardEvent,
+} from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import styled, { css } from 'styled-components';
 import { ragApi } from '../../shared/api/client';
@@ -96,7 +102,54 @@ const Progress = styled(Card)`
 const CompareGrid = styled.div`
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(18rem, 1fr));
-  gap: 14px;
+  gap: var(--rp-panel-gap);
+  @media (max-width: 60rem) {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  @media (max-width: 47.9375rem) {
+    grid-template-columns: minmax(0, 1fr);
+  }
+`;
+const CompareControls = styled.div`
+  display: flex;
+  gap: var(--rp-space-3);
+  margin: 0 0 var(--rp-space-5);
+  align-items: stretch;
+  input {
+    min-width: 0;
+  }
+  @media (max-width: 47.9375rem) {
+    flex-direction: column;
+    button {
+      width: 100%;
+    }
+  }
+`;
+const CandidateSwitcher = styled.div`
+  display: none;
+  gap: var(--rp-space-2);
+  overflow-x: auto;
+  margin: 0 0 var(--rp-space-4);
+  padding-bottom: var(--rp-space-1);
+  button {
+    flex: 0 0 auto;
+    min-height: var(--rp-touch-target);
+    padding: 0 var(--rp-space-3);
+    border: 1px solid ${theme.colors.line};
+    border-radius: ${theme.radius.pill};
+    background: ${theme.colors.surface};
+    color: ${theme.colors.muted};
+    font-size: var(--rp-font-size-13);
+    font-weight: var(--rp-weight-semibold);
+  }
+  button[aria-pressed='true'] {
+    border-color: ${theme.colors.brand};
+    background: ${theme.colors.brandSoft};
+    color: ${theme.colors.brand};
+  }
+  @media (max-width: 47.9375rem) {
+    display: flex;
+  }
 `;
 const CandidateCard = styled(Card)<{ $selected: boolean }>`
   padding: 17px;
@@ -104,7 +157,8 @@ const CandidateCard = styled(Card)<{ $selected: boolean }>`
   flex-direction: column;
   gap: 14px;
   border-color: ${({ $selected }) => ($selected ? theme.colors.brand : theme.colors.line)};
-  box-shadow: ${({ $selected }) => ($selected ? '0 0 0 2px #e1f0e9' : theme.shadow)};
+  box-shadow: ${({ $selected }) =>
+    $selected ? '0 0 0 2px var(--rp-surface-selected)' : theme.shadow};
   .candidate-header {
     display: flex;
     gap: 10px;
@@ -158,7 +212,7 @@ const CandidateCard = styled(Card)<{ $selected: boolean }>`
   }
 `;
 const Citation = styled.button`
-  border: 1px solid #b7cdf9;
+  border: 1px solid var(--rp-border-focus);
   background: ${theme.colors.progressSoft};
   color: ${theme.colors.progress};
   border-radius: 999px;
@@ -170,7 +224,7 @@ const Citation = styled.button`
   margin-left: 3px;
   &:focus-visible {
     outline: 0;
-    box-shadow: 0 0 0 3px #b7cdf9;
+    box-shadow: var(--rp-focus-ring);
   }
 `;
 const Bar = styled.div`
@@ -187,6 +241,18 @@ const Bar = styled.div`
   justify-content: space-between;
   align-items: center;
   gap: 12px;
+  @media (max-width: 47.9375rem) {
+    bottom: var(--rp-space-2);
+    flex-direction: column;
+    align-items: stretch;
+    .bar-actions {
+      display: grid !important;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+    .bar-actions button {
+      min-width: 0;
+    }
+  }
 `;
 const Side = styled.aside`
   border-right: 1px solid ${theme.colors.line};
@@ -324,6 +390,12 @@ const Evidence = styled.aside`
     padding: 12px;
     border-radius: ${theme.radius.sm};
   }
+  @media (max-width: 47.9375rem) {
+    inset: auto var(--rp-space-2) var(--rp-space-2);
+    width: auto;
+    max-height: min(70dvh, 38rem);
+    overflow-y: auto;
+  }
 `;
 const Confirm = styled.div`
   position: fixed;
@@ -354,7 +426,26 @@ const Confirm = styled.div`
       gap: 8px;
       margin-top: 24px;
     }
+    @media (max-width: 47.9375rem) {
+      width: calc(100vw - var(--rp-space-4));
+      padding: var(--rp-space-5);
+      .actions {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+    }
   }
+`;
+const LiveUpdate = styled.p`
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 `;
 
 function CitationChip({
@@ -362,14 +453,14 @@ function CitationChip({
   onOpen,
 }: {
   candidate: PipelineCandidate;
-  onOpen: (candidate: PipelineCandidate) => void;
+  onOpen: (candidate: PipelineCandidate, trigger: HTMLElement) => void;
 }) {
   if (!candidate.evidence.length) return null;
   return (
     <Citation
       type="button"
       title={`${candidate.evidence[0].title}: ${candidate.evidence[0].excerpt}`}
-      onClick={() => onOpen(candidate)}
+      onClick={(event) => onOpen(candidate, event.currentTarget)}
       aria-label={`${candidate.evidence[0].title} 근거 열기`}
     >
       1
@@ -385,7 +476,7 @@ function Candidate({
   candidate: PipelineCandidate;
   selected: boolean;
   onSelect: () => void;
-  onOpen: (candidate: PipelineCandidate) => void;
+  onOpen: (candidate: PipelineCandidate, trigger: HTMLElement) => void;
 }) {
   const noEvidence = candidate.evidence.length === 0;
   return (
@@ -422,14 +513,61 @@ function Candidate({
           <CitationChip candidate={candidate} onOpen={onOpen} />
         </p>
       )}
+      {candidate.runtime?.fallback && (
+        <div className="empty-answer" role="status">
+          개발용 fallback 검색 · {candidate.runtime.warning ?? candidate.runtime.provider}
+        </div>
+      )}
       <div className="bottom">
-        <button className="help" onClick={() => onOpen(candidate)}>
-          원본 조각만 보기
-        </button>
+        {noEvidence ? (
+          <span>원본 조각 없음</span>
+        ) : (
+          <button
+            type="button"
+            className="help"
+            onClick={(event) => onOpen(candidate, event.currentTarget)}
+          >
+            원본 조각만 보기
+          </button>
+        )}
         <span>응답 {(candidate.latencyMs / 1000).toFixed(1)}초</span>
       </div>
     </CandidateCard>
   );
+}
+
+function trapSetupDialog(event: ReactKeyboardEvent<HTMLElement>) {
+  if (event.key !== 'Tab') return;
+  const items = Array.from(
+    event.currentTarget.querySelectorAll<HTMLElement>(
+      'button:not(:disabled), input:not(:disabled), [tabindex]:not([tabindex="-1"])',
+    ),
+  );
+  if (!items.length) return;
+  const first = items[0];
+  const last = items[items.length - 1];
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  }
+  if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
+}
+
+function useMediaQuery(query: string) {
+  const [matches, setMatches] = useState(() =>
+    typeof window !== 'undefined' ? window.matchMedia(query).matches : false,
+  );
+  useEffect(() => {
+    const media = window.matchMedia(query);
+    const update = () => setMatches(media.matches);
+    update();
+    media.addEventListener('change', update);
+    return () => media.removeEventListener('change', update);
+  }, [query]);
+  return matches;
 }
 
 export function RagSetupPage() {
@@ -438,10 +576,20 @@ export function RagSetupPage() {
   const [detail, setDetail] = useState<RagInstanceDetail>();
   const [round, setRound] = useState<ComparisonRound>();
   const [selected, setSelected] = useState<string[]>([]);
+  const [activeCandidateId, setActiveCandidateId] = useState<string>();
   const [question, setQuestion] = useState('');
   const [showConfirm, setShowConfirm] = useState(false);
   const [evidence, setEvidence] = useState<PipelineCandidate>();
   const [error, setError] = useState<string>();
+  const [compareSubmitting, setCompareSubmitting] = useState(false);
+  const [finalizeSubmitting, setFinalizeSubmitting] = useState(false);
+  const [compareError, setCompareError] = useState<string>();
+  const [finalizeError, setFinalizeError] = useState<string>();
+  const evidenceTriggerRef = useRef<HTMLElement | null>(null);
+  const confirmTriggerRef = useRef<HTMLElement | null>(null);
+  const evidenceDialogRef = useRef<HTMLElement | null>(null);
+  const confirmDialogRef = useRef<HTMLDivElement | null>(null);
+  const singleCandidateMode = useMediaQuery('(max-width: 47.9375rem)');
   useEffect(() => {
     let cancelled = false;
     const sync = async () => {
@@ -506,6 +654,18 @@ export function RagSetupPage() {
       })),
     [round, selected],
   );
+  useEffect(() => {
+    setActiveCandidateId((current) => {
+      if (current && round?.candidates.some((candidate) => candidate.id === current))
+        return current;
+      return round?.candidates[0]?.id;
+    });
+  }, [round?.id]);
+  const visibleCandidates = useMemo(() => {
+    if (!singleCandidateMode) return counts;
+    const current = activeCandidateId ?? counts[0]?.id;
+    return counts.filter((candidate) => candidate.id === current);
+  }, [activeCandidateId, counts, singleCandidateMode]);
   const winner = useMemo(() => {
     const sorted = [...counts].sort((a, b) => b.selectionCount - a.selectionCount);
     return sorted[0] &&
@@ -515,23 +675,69 @@ export function RagSetupPage() {
       : undefined;
   }, [counts]);
   const nextRound = async () => {
-    if (!round || !detail) return;
-    if (selected.length) await ragApi.vote(round.id, selected);
-    const next = await ragApi.compare(
-      id,
-      question || round.question,
-      detail.documents.map((document) => document.id),
-    );
-    setRound(next);
-    setSelected([]);
-    setQuestion('');
+    if (!round || !detail || compareSubmitting) return;
+    setCompareSubmitting(true);
+    setCompareError(undefined);
+    try {
+      if (selected.length) await ragApi.vote(round.id, selected);
+      const next = await ragApi.compare(
+        id,
+        question || round.question,
+        detail.documents.map((document) => document.id),
+      );
+      setRound(next);
+      setSelected([]);
+      setQuestion('');
+    } catch (item) {
+      setCompareError((item as Error).message);
+    } finally {
+      setCompareSubmitting(false);
+    }
   };
   const finalize = async () => {
-    if (!winner || !round || !detail) return;
-    if (selected.length) await ragApi.vote(round.id, selected);
-    await ragApi.finalize(id, detail.documents[0].id);
-    navigate(`/rag/${id}`);
+    if (!winner || !round || !detail || finalizeSubmitting) return;
+    setFinalizeSubmitting(true);
+    setFinalizeError(undefined);
+    try {
+      if (selected.length) await ragApi.vote(round.id, selected);
+      await ragApi.finalize(id, detail.documents[0].id);
+      navigate(`/rag/${id}`);
+    } catch (item) {
+      setFinalizeError((item as Error).message);
+    } finally {
+      setFinalizeSubmitting(false);
+    }
   };
+  const closeEvidence = () => {
+    setEvidence(undefined);
+    window.setTimeout(() => evidenceTriggerRef.current?.focus(), 0);
+  };
+  const closeConfirm = () => {
+    setShowConfirm(false);
+    window.setTimeout(() => confirmTriggerRef.current?.focus(), 0);
+  };
+  useEffect(() => {
+    if (evidence)
+      window.setTimeout(
+        () => evidenceDialogRef.current?.querySelector<HTMLElement>('button')?.focus(),
+        0,
+      );
+    if (showConfirm)
+      window.setTimeout(
+        () => confirmDialogRef.current?.querySelector<HTMLElement>('button')?.focus(),
+        0,
+      );
+  }, [evidence, showConfirm]);
+  useEffect(() => {
+    const onEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        if (showConfirm) closeConfirm();
+        else if (evidence) closeEvidence();
+      }
+    };
+    window.addEventListener('keydown', onEscape);
+    return () => window.removeEventListener('keydown', onEscape);
+  }, [evidence, showConfirm]);
   if (error) return <ErrorState message={error} />;
   if (!detail) return <LoadingState />;
   const isPreparing =
@@ -550,7 +756,11 @@ export function RagSetupPage() {
             대시보드로
           </Button>
         </PageHeader>
-        <Progress role="status" aria-live="polite">
+        <Progress>
+          <LiveUpdate role="status" aria-live="polite">
+            {detail.latestJob?.currentStep} · {detail.latestJob?.completed}/
+            {detail.latestJob?.total} 단계 완료
+          </LiveUpdate>
           <div className="file">{detail.documents.map((document) => document.name).join(', ')}</div>
           {detail.latestJob?.stages.map((stage) => (
             <div className="row" key={stage.key}>
@@ -637,32 +847,63 @@ export function RagSetupPage() {
     <>
       <PageHeader>
         <div>
-          <Pill $tone="warning">튜닝 중 · 라운드 1</Pill>
+          <Pill $tone="warning">튜닝 중 · 현재 라운드 {round.id.replace(/^.*?(\d+)$/, '$1')}</Pill>
           <h1>답변과 근거를 비교해 주세요.</h1>
-          <p>가장 도움이 되는 결과를 하나 이상 고르면, 선택 횟수가 쌓여요.</p>
+          <p>
+            후보 {counts.length}개를 비교 중이에요. 가장 도움이 되는 결과를 하나 이상 고르면, 선택
+            횟수가 쌓여요.
+          </p>
         </div>
         <Button $variant="secondary" onClick={() => navigate('/rag')}>
           대시보드로
         </Button>
       </PageHeader>
-      <div style={{ display: 'flex', gap: 10, margin: '0 0 18px' }}>
+      <CompareControls>
         <Input
           aria-label="비교할 질문"
           value={question}
           onChange={(event) => setQuestion(event.target.value)}
           placeholder={round.question}
-          onKeyDown={(event) => event.key === 'Enter' && nextRound()}
+          onKeyDown={(event) => {
+            if (event.key === 'Enter' && !event.nativeEvent.isComposing) void nextRound();
+          }}
         />
-        <Button onClick={nextRound}>비교하기</Button>
-      </div>
+        <Button onClick={() => void nextRound()} disabled={compareSubmitting}>
+          {compareSubmitting ? '비교 중…' : '비교하기'}
+        </Button>
+      </CompareControls>
+      {compareError && (
+        <Card role="alert" style={{ padding: 16, marginBottom: 16 }}>
+          <p>{compareError}</p>
+          <Button $variant="secondary" onClick={() => void nextRound()}>
+            같은 조건으로 다시 시도
+          </Button>
+        </Card>
+      )}
+      <CandidateSwitcher aria-label="비교 후보 전환">
+        {counts.map((candidate, index) => (
+          <button
+            type="button"
+            key={candidate.id}
+            aria-pressed={(activeCandidateId ?? counts[0]?.id) === candidate.id}
+            onClick={() => setActiveCandidateId(candidate.id)}
+          >
+            후보 {index + 1}: {candidate.plainLabel}
+            {selected.includes(candidate.id) ? ' · 선택됨' : ''}
+          </button>
+        ))}
+      </CandidateSwitcher>
       <CompareGrid>
-        {counts.map((candidate) => (
+        {visibleCandidates.map((candidate) => (
           <Candidate
             key={candidate.id}
             candidate={candidate}
             selected={selected.includes(candidate.id)}
             onSelect={() => toggle(candidate.id)}
-            onOpen={setEvidence}
+            onOpen={(candidate, trigger) => {
+              evidenceTriggerRef.current = trigger;
+              setEvidence(candidate);
+            }}
           />
         ))}
       </CompareGrid>
@@ -675,26 +916,35 @@ export function RagSetupPage() {
               : '아직 한 가지 방식이 앞서지 않았어요. 다음 질문에서도 비교해 주세요.'}
           </div>
         </div>
-        <div style={{ display: 'flex', gap: 8 }}>
-          <Button $variant="secondary" onClick={nextRound}>
-            다음 라운드 진행
+        <div className="bar-actions" style={{ display: 'flex', gap: 8 }}>
+          <Button
+            $variant="secondary"
+            onClick={() => void nextRound()}
+            disabled={compareSubmitting}
+          >
+            {compareSubmitting ? '비교 중…' : '다음 라운드 진행'}
           </Button>
           <Button
             disabled={!winner}
             aria-describedby="tie-help"
-            onClick={() => setShowConfirm(true)}
+            onClick={(event) => {
+              confirmTriggerRef.current = event.currentTarget;
+              setShowConfirm(true);
+            }}
           >
             완료{winner ? ` (${winner.plainLabel})` : ''}
           </Button>
         </div>
       </Bar>
       {evidence && (
-        <Evidence role="dialog" aria-label="원본 근거">
-          <Button
-            $variant="ghost"
-            style={{ float: 'right' }}
-            onClick={() => setEvidence(undefined)}
-          >
+        <Evidence
+          role="dialog"
+          aria-modal="true"
+          aria-label="원본 근거"
+          ref={evidenceDialogRef}
+          onKeyDown={trapSetupDialog}
+        >
+          <Button $variant="ghost" style={{ float: 'right' }} onClick={closeEvidence}>
             닫기
           </Button>
           <Pill $tone="brand">{evidence.evidence[0]?.page}</Pill>
@@ -703,8 +953,15 @@ export function RagSetupPage() {
         </Evidence>
       )}
       {showConfirm && winner && (
-        <Confirm role="dialog" aria-modal="true" aria-label="확정 확인">
-          <div className="dialog">
+        <Confirm role="presentation">
+          <div
+            className="dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-label="확정 확인"
+            ref={confirmDialogRef}
+            onKeyDown={trapSetupDialog}
+          >
             <Pill $tone="warning">최종 확인</Pill>
             <h2>이 방식으로 확정할까요?</h2>
             <p style={{ color: theme.colors.muted }}>
@@ -718,11 +975,26 @@ export function RagSetupPage() {
               답변: {winner.answer}
             </div>
             <div className="actions">
-              <Button $variant="secondary" autoFocus onClick={() => setShowConfirm(false)}>
+              <Button
+                $variant="secondary"
+                autoFocus
+                onClick={closeConfirm}
+                disabled={finalizeSubmitting}
+              >
                 다시 비교하기
               </Button>
-              <Button onClick={finalize}>확정하기</Button>
+              <Button onClick={() => void finalize()} disabled={finalizeSubmitting}>
+                {finalizeSubmitting ? '확정 중…' : '확정하기'}
+              </Button>
             </div>
+            {finalizeError && (
+              <p role="alert">
+                {finalizeError}{' '}
+                <Button $variant="ghost" onClick={() => void finalize()}>
+                  다시 시도
+                </Button>
+              </p>
+            )}
           </div>
         </Confirm>
       )}
