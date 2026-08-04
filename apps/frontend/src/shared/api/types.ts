@@ -34,6 +34,67 @@ export interface RagDocument {
   comparisonScope?: 'FULL' | 'SAMPLE';
   estimatedChunkCount?: number;
   comparisonChunkCount?: number;
+  fullReindexRequired?: boolean;
+  fullReindexReady?: boolean;
+  fullReindexState?: RagProcessingJob['state'];
+  provenance?: DocumentProvenance;
+}
+
+export interface DocumentProvenance {
+  checksum?: string;
+  deduplication?: 'NEW_SOURCE' | 'DUPLICATE_REUSED' | 'DUPLICATE_REPLACED' | 'UNKNOWN';
+  parser?: string;
+  parserVersion?: string;
+  chunking?: string;
+  embeddingModel?: string;
+  modelVersion?: string;
+  originalAvailable?: boolean;
+  reparse?: {
+    available: boolean;
+    state?: 'IDLE' | 'QUEUED' | 'PARSING' | 'SUCCEEDED' | 'FAILED';
+    impact?: string;
+  };
+}
+
+export type RetuningQualityState = 'MEASURED' | 'FALLBACK' | 'MISSING' | 'PENDING';
+
+export interface RetuningComparisonState {
+  beforeLabel: string;
+  beforeQuality: RetuningQualityState;
+  afterLabel: string;
+  afterQuality: RetuningQualityState;
+  outcomeArtifactId?: string;
+}
+
+export interface RetuningSignal {
+  recommended: boolean;
+  negativeCount: number;
+  positiveCount?: number;
+  feedbackTotal?: number;
+  threshold: number;
+  thresholdKind?: 'WEIGHTED_NEGATIVE_FEEDBACK' | 'COUNT';
+  eligibleDocumentIds: string[];
+  reasons: string[];
+  action?: 'START_RETUNE';
+  policyVersion?: string;
+  comparison?: RetuningComparisonState;
+}
+
+export type ExplorationEvidenceState = 'MEASURED' | 'FALLBACK' | 'MISSING' | 'PENDING';
+
+export interface CandidateExploration {
+  id: string;
+  phase: string;
+  poolCount?: number;
+  proposedCandidateIds: string[];
+  proposedCandidates: { id: string; label: string }[];
+  rationales: string[];
+  evidenceBoundary: ExplorationEvidenceState;
+  rollback?: {
+    canRollback: boolean;
+    canRestore: boolean;
+    state?: string;
+  };
 }
 
 export interface RagInstance {
@@ -64,6 +125,11 @@ export interface RagProcessingJob {
   canCancel: boolean;
   errorMessage?: string;
   stages: { key: string; label: string; state: 'QUEUED' | 'SUCCEEDED' | 'FAILED' }[];
+  kind?: string;
+  attempt?: number;
+  createdAt?: string;
+  completedAt?: string;
+  operationalState?: string;
 }
 
 export interface PipelineCandidate {
@@ -99,6 +165,8 @@ export interface GroundedGenerationMetadata {
   fallback: boolean;
   provider?: string;
   detail?: string;
+  fallbackReason?: string;
+  groundingValid?: boolean;
 }
 
 export interface ModelServiceStatus {
@@ -135,6 +203,8 @@ export interface RagInstanceDetail extends RagInstance {
   lastRound?: ComparisonRound;
   latestJob?: RagProcessingJob;
   fullReindexJob?: RagProcessingJob;
+  retuningSignal?: RetuningSignal;
+  candidateExploration?: CandidateExploration;
 }
 
 export interface CreateRagInput {
@@ -192,4 +262,9 @@ export interface ChatAnswer {
   };
   generation?: GroundedGenerationMetadata;
   documentCoverage?: SearchDocumentCoverage[];
+}
+
+export interface RetuneStart {
+  job?: RagProcessingJob;
+  nextAction?: string;
 }

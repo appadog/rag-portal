@@ -8,29 +8,33 @@ embedding/vector layer is introduced.
 from __future__ import annotations
 
 from collections import Counter
+import base64
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
+import hashlib
 import json
 import os
 import re
 from threading import RLock
-from typing import Annotated, AsyncIterator
+from typing import Annotated, AsyncIterator, Callable
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException, Query, status
+from fastapi import FastAPI, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
 
 from app.state_store import StateStore
-from app.document_parser import extract_document
-from app.job_queue import backend_name, dispatch
+from app.document_parser import decode_source, extract_document
+from app.job_queue import backend_name, dispatch, queue_observability
 from app.model_runtime import execution_plan, runtime_catalog
 from app.retrieval import rank as rank_segments
 from app.retrieval import rerank as rerank_segments
 from app.retrieval import embed
 from app.generation import GenerationEndpointError, GenerationResult, generate_grounded
+from app.source_storage import SourceStorageError, source_storage
 
 
 API_PREFIX = "/api/v1"
@@ -39,6 +43,13 @@ STATE_LOCK = RLock()
 DEFAULT_COMPARISON_CHUNK_THRESHOLD = 500
 DEFAULT_MULTI_DOCUMENT_CONTEXT_LIMIT = 4
 DEFAULT_MULTI_DOCUMENT_RERANK_TOP_K = 8
+RETUNING_SIGNAL_VERSION = "2026-08-03.v1"
+RETUNING_NEGATIVE_WEIGHT_THRESHOLD = 2.0
+RETUNING_INTEGRITY_EVENT_THRESHOLD = 2
+SOURCE_PROVENANCE_VERSION = "source-provenance.v1"
+PARSER_PIPELINE_VERSION = "document-parser.v1"
+CHUNKING_PIPELINE_VERSION = "adaptive-chunking.v1"
+MODEL_PROVENANCE_VERSION = "embedding-model-contract.v1"
 
 
 class InstanceStatus(StrEnum):
@@ -55,6 +66,7 @@ class JobState(StrEnum):
     SUCCEEDED = "SUCCEEDED"
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
+    DEAD_LETTER = "DEAD_LETTER"
 
 
 class CandidateState(StrEnum):
@@ -89,12 +101,19 @@ class ComparisonScope(StrEnum):
 class JobKind(StrEnum):
     PROCESSING = "PROCESSING"
     FULL_REINDEX = "FULL_REINDEX"
+    REPARSE = "REPARSE"
 
 
 class ArtifactStatus(StrEnum):
     PROCESSING = "PROCESSING"
     READY = "READY"
     FAILED = "FAILED"
+
+
+class ExplorationStatus(StrEnum):
+    PROPOSED = "PROPOSED"
+    ROLLED_BACK = "ROLLED_BACK"
+    RESTORED = "RESTORED"
 
 
 class Questionnaire(BaseModel):
@@ -159,6 +178,16 @@ class RetuneRequest(BaseModel):
     reason: str | None = Field(default=None, max_length=1000)
 
 
+class ReparseRequest(BaseModel):
+    reason: str | None = Field(default=None, max_length=1000)
+
+
+class CandidateExplorationRequest(BaseModel):
+    document_ids: list[str] = Field(min_length=1)
+    question: str | None = Field(default=None, max_length=1000)
+    max_proposals: Annotated[int, Field(ge=1, le=6)] = 3
+
+
 @dataclass
 class Segment:
     id: str
@@ -176,6 +205,10 @@ class Document:
     content: str
     segments: list[Segment]
     raw_content_base64: str | None = None
+    source_metadata: dict = field(default_factory=dict)
+    parser_metadata: dict = field(default_factory=dict)
+    chunking_metadata: dict = field(default_factory=dict)
+    model_metadata: dict = field(default_factory=dict)
     parser: str | None = None
     used_ocr: bool = False
     profile: str = "short"
@@ -219,6 +252,9 @@ class Candidate:
     estimated_chunk_count: int = 0
     selected_chunk_count: int = 0
     comparison_scope: ComparisonScope = ComparisonScope.FULL
+    exploration_round_id: str | None = None
+    parent_candidate_id: str | None = None
+    archived: bool = False
 
 
 @dataclass(frozen=True)
@@ -249,6 +285,18 @@ class ProcessingJob:
     attempt: int = 1
     kind: JobKind = JobKind.PROCESSING
     comparison_plans: dict[str, dict] = field(default_factory=dict)
+    idempotency_key: str = ""
+    dispatch_backend: str | None = None
+    dispatch_message_id: str | None = None
+    dispatch_fallback_reason: str | None = None
+    execution_status: str = "IDLE"
+    execution_count: int = 0
+    worker_id: str | None = None
+    last_heartbeat_at: datetime | None = None
+    max_attempts: int = 0
+    retry_backoff_seconds: int = 0
+    next_attempt_at: datetime | None = None
+    dead_letter_reason: str | None = None
 
 
 @dataclass
@@ -261,6 +309,23 @@ class ComparisonRound:
     created_at: datetime
     selected_candidate_ids: list[str] = field(default_factory=list)
     candidate_states: dict[str, CandidateState] = field(default_factory=dict)
+
+
+@dataclass
+class CandidateExploration:
+    id: str
+    instance_id: str
+    document_ids: list[str]
+    created_at: datetime
+    question: str | None = None
+    max_proposals: int = 3
+    status: ExplorationStatus = ExplorationStatus.PROPOSED
+    candidate_pool_ids: list[str] = field(default_factory=list)
+    narrowed_candidate_ids: list[str] = field(default_factory=list)
+    proposals: list[dict] = field(default_factory=list)
+    rationale: list[dict] = field(default_factory=list)
+    ledger: list[dict] = field(default_factory=list)
+    artifact_id: str | None = None
 
 
 @dataclass
@@ -294,6 +359,7 @@ INSTANCES: dict[str, RagInstance] = {}
 CANDIDATES: dict[str, Candidate] = {}
 JOBS: dict[str, ProcessingJob] = {}
 ROUNDS: dict[str, ComparisonRound] = {}
+EXPLORATIONS: dict[str, CandidateExploration] = {}
 FEEDBACK: list[dict] = []
 ARTIFACTS: dict[str, Artifact] = {}
 BENCHMARK_RUNS: list[dict] = []
@@ -326,6 +392,10 @@ def state_payload() -> dict:
                         "content_type": document.content_type,
                         "content": document.content,
                         "raw_content_base64": document.raw_content_base64,
+                        "source_metadata": document.source_metadata,
+                        "parser_metadata": document.parser_metadata,
+                        "chunking_metadata": document.chunking_metadata,
+                        "model_metadata": document.model_metadata,
                         "segments": [
                             {
                                 "id": segment.id,
@@ -392,6 +462,9 @@ def state_payload() -> dict:
                 "estimated_chunk_count": candidate.estimated_chunk_count,
                 "selected_chunk_count": candidate.selected_chunk_count,
                 "comparison_scope": candidate.comparison_scope,
+                "exploration_round_id": candidate.exploration_round_id,
+                "parent_candidate_id": candidate.parent_candidate_id,
+                "archived": candidate.archived,
             }
             for candidate in CANDIDATES.values()
         ],
@@ -415,6 +488,18 @@ def state_payload() -> dict:
                 "attempt": job.attempt,
                 "kind": job.kind,
                 "comparison_plans": job.comparison_plans,
+                "idempotency_key": job.idempotency_key,
+                "dispatch_backend": job.dispatch_backend,
+                "dispatch_message_id": job.dispatch_message_id,
+                "dispatch_fallback_reason": job.dispatch_fallback_reason,
+                "execution_status": job.execution_status,
+                "execution_count": job.execution_count,
+                "worker_id": job.worker_id,
+                "last_heartbeat_at": encode_time(job.last_heartbeat_at),
+                "max_attempts": job.max_attempts,
+                "retry_backoff_seconds": job.retry_backoff_seconds,
+                "next_attempt_at": encode_time(job.next_attempt_at),
+                "dead_letter_reason": job.dead_letter_reason,
             }
             for job in JOBS.values()
         ],
@@ -430,6 +515,24 @@ def state_payload() -> dict:
                 "candidate_states": round_.candidate_states,
             }
             for round_ in ROUNDS.values()
+        ],
+        "candidate_explorations": [
+            {
+                "id": exploration.id,
+                "instance_id": exploration.instance_id,
+                "document_ids": exploration.document_ids,
+                "created_at": encode_time(exploration.created_at),
+                "question": exploration.question,
+                "max_proposals": exploration.max_proposals,
+                "status": exploration.status,
+                "candidate_pool_ids": exploration.candidate_pool_ids,
+                "narrowed_candidate_ids": exploration.narrowed_candidate_ids,
+                "proposals": exploration.proposals,
+                "rationale": exploration.rationale,
+                "ledger": exploration.ledger,
+                "artifact_id": exploration.artifact_id,
+            }
+            for exploration in EXPLORATIONS.values()
         ],
         "artifacts": [
             {
@@ -465,6 +568,7 @@ def restore_state() -> None:
         CANDIDATES.clear()
         JOBS.clear()
         ROUNDS.clear()
+        EXPLORATIONS.clear()
         ARTIFACTS.clear()
         FEEDBACK.clear()
         BENCHMARK_RUNS.clear()
@@ -487,6 +591,10 @@ def restore_state() -> None:
                     content=raw_document["content"],
                     segments=[Segment(**segment) for segment in raw_document.get("segments", [])],
                     raw_content_base64=raw_document.get("raw_content_base64"),
+                    source_metadata=raw_document.get("source_metadata", {}),
+                    parser_metadata=raw_document.get("parser_metadata", {}),
+                    chunking_metadata=raw_document.get("chunking_metadata", {}),
+                    model_metadata=raw_document.get("model_metadata", {}),
                     profile=raw_document.get("profile", "short"),
                     chunking_analysis=raw_document.get("chunking_analysis", {}),
                     parse_status=raw_document.get("parse_status", "UPLOADED"),
@@ -517,6 +625,9 @@ def restore_state() -> None:
                     "preparation_state": CandidateState(item.get("preparation_state", legacy_state)),
                     "prepared_at": decode_time(item.get("prepared_at")),
                     "comparison_scope": ComparisonScope(item.get("comparison_scope", ComparisonScope.FULL)),
+                    "exploration_round_id": item.get("exploration_round_id"),
+                    "parent_candidate_id": item.get("parent_candidate_id"),
+                    "archived": item.get("archived", False),
                 }
             )
         documents_by_id = {
@@ -549,6 +660,20 @@ def restore_state() -> None:
                 attempt=item.get("attempt", 1),
                 kind=JobKind(item.get("kind", JobKind.PROCESSING)),
                 comparison_plans=item.get("comparison_plans", {}),
+                idempotency_key=item.get("idempotency_key", ""),
+                dispatch_backend=item.get("dispatch_backend"),
+                dispatch_message_id=item.get("dispatch_message_id"),
+                dispatch_fallback_reason=item.get("dispatch_fallback_reason"),
+                # A process restart has no active worker lease; pending jobs are
+                # safely reclaimed through their durable idempotency key.
+                execution_status="IDLE" if JobState(item["state"]) in {JobState.QUEUED, JobState.PARSING, JobState.GENERATING_CANDIDATES, JobState.INDEXING} else item.get("execution_status", "IDLE"),
+                execution_count=item.get("execution_count", 0),
+                worker_id=item.get("worker_id"),
+                last_heartbeat_at=decode_time(item.get("last_heartbeat_at")),
+                max_attempts=item.get("max_attempts", job_max_attempts()),
+                retry_backoff_seconds=item.get("retry_backoff_seconds", job_retry_backoff_seconds()),
+                next_attempt_at=decode_time(item.get("next_attempt_at")),
+                dead_letter_reason=item.get("dead_letter_reason"),
             )
         for item in payload.get("rounds", []):
             ROUNDS[item["id"]] = ComparisonRound(
@@ -563,6 +688,22 @@ def restore_state() -> None:
                     candidate_id: CandidateState(state)
                     for candidate_id, state in item.get("candidate_states", {}).items()
                 },
+            )
+        for item in payload.get("candidate_explorations", []):
+            EXPLORATIONS[item["id"]] = CandidateExploration(
+                id=item["id"],
+                instance_id=item["instance_id"],
+                document_ids=item.get("document_ids", []),
+                created_at=decode_time(item.get("created_at")) or datetime.now(UTC),
+                question=item.get("question"),
+                max_proposals=item.get("max_proposals", 3),
+                status=ExplorationStatus(item.get("status", ExplorationStatus.PROPOSED)),
+                candidate_pool_ids=item.get("candidate_pool_ids", []),
+                narrowed_candidate_ids=item.get("narrowed_candidate_ids", []),
+                proposals=item.get("proposals", []),
+                rationale=item.get("rationale", []),
+                ledger=item.get("ledger", []),
+                artifact_id=item.get("artifact_id"),
             )
         for item in payload.get("artifacts", []):
             ARTIFACTS[item["id"]] = Artifact(
@@ -587,6 +728,84 @@ def now() -> str:
 
 def new_id() -> str:
     return str(uuid4())
+
+
+def source_key_for(instance_id: str, checksum_sha256: str) -> str:
+    return f"instances/{instance_id}/sources/{checksum_sha256}"
+
+
+def store_document_source(instance: RagInstance, document: Document, data: bytes) -> None:
+    checksum = hashlib.sha256(data).hexdigest()
+    prior = next(
+        (
+            item
+            for item in instance.documents.values()
+            if item.id != document.id and item.source_metadata.get("checksum_sha256") == checksum
+        ),
+        None,
+    )
+    key = source_key_for(instance.id, checksum)
+    stored = source_storage().put_if_absent(key, data)
+    document.source_metadata = {
+        "version": SOURCE_PROVENANCE_VERSION,
+        "checksum_algorithm": "sha256",
+        "checksum_sha256": checksum,
+        "size_bytes": len(data),
+        "storage_backend": stored.backend,
+        "storage_key": stored.key,
+        "deduplication": {
+            "scope": "INSTANCE",
+            "policy": "REUSE_EXISTING_SOURCE_OBJECT",
+            "status": "DEDUPLICATED" if prior or not stored.created else "STORED",
+            "deduplicated_from_document_id": prior.id if prior else None,
+        },
+        "stored_at": now(),
+    }
+
+
+def source_data_for(document: Document) -> bytes:
+    metadata = document.source_metadata
+    if metadata.get("storage_key"):
+        return source_storage().get(metadata["storage_key"])
+    # Legacy snapshots retain inline source content; make its non-reproducible
+    # status explicit until a new upload/reparse source object is created.
+    return decode_source(document.content, document.raw_content_base64)
+
+
+def parse_document_from_stored_source(instance: RagInstance, document: Document) -> None:
+    data = source_data_for(document)
+    parsed = extract_document(
+        filename=document.filename,
+        content_type=document.content_type,
+        content=None,
+        content_base64=base64.b64encode(data).decode("ascii"),
+    )
+    document.content = parsed.text
+    document.parser = parsed.parser
+    document.used_ocr = parsed.used_ocr
+    document.segments = split_segments(parsed.text)
+    document.chunking_analysis = analyze_document_for_chunking(document)
+    document.profile = document_profile(document, document.chunking_analysis)
+    configure_comparison_scope(document)
+    previous_revision = int(document.parser_metadata.get("parse_revision", 0))
+    document.parser_metadata = {
+        "version": PARSER_PIPELINE_VERSION,
+        "parser": parsed.parser,
+        "used_ocr": parsed.used_ocr,
+        "warnings": parsed.warnings,
+        "parse_revision": previous_revision + 1,
+        "parsed_at": now(),
+    }
+    document.chunking_metadata = {
+        "version": CHUNKING_PIPELINE_VERSION,
+        "profile": document.profile,
+        "analysis": document.chunking_analysis,
+        "comparison_scope": document.comparison_scope,
+        "comparison_chunk_threshold": document.comparison_chunk_threshold,
+        "estimated_chunk_count": document.estimated_chunk_count,
+        "selected_chunk_count": document.selected_chunk_count,
+    }
+    document.parse_status = "PARSED"
 
 
 def not_found(resource: str) -> HTTPException:
@@ -970,6 +1189,101 @@ def create_candidates(instance: RagInstance, document: Document) -> list[Candida
     return candidates
 
 
+def exploration_signals(candidate: Candidate) -> dict:
+    """Bounded, explainable operational evidence; never a quality score."""
+    observed_states = [
+        round_.candidate_states.get(candidate.id)
+        for round_ in ROUNDS.values()
+        if candidate.id in round_.candidate_ids and candidate.id in round_.candidate_states
+    ]
+    ready_evidence = sum(state == CandidateState.READY for state in observed_states)
+    no_evidence = sum(state == CandidateState.NO_EVIDENCE for state in observed_states)
+    prepared = candidate.preparation_state == CandidateState.READY
+    priority = (100 if prepared else 0) + (candidate.selection_count * 10) + (ready_evidence * 4) - (no_evidence * 3)
+    return {
+        "prepared": prepared,
+        "preparation_state": candidate.preparation_state,
+        "selection_count": candidate.selection_count,
+        "ready_evidence_count": ready_evidence,
+        "no_evidence_count": no_evidence,
+        "vector_count": len(candidate.vectors),
+        "priority": priority,
+        "interpretation": "작업 준비 상태·사용자 투표·비교 근거의 제한된 관측값입니다. 품질 점수 또는 자동 선택 근거가 아닙니다.",
+    }
+
+
+def exploration_variant(candidate: Candidate) -> tuple[dict, str, str]:
+    parameters = dict(candidate.chunking_parameters)
+    if candidate.chunking_strategy == "fixed":
+        parameters["width_chars"] = clamp(round(int(parameters.get("width_chars", 360)) * 0.82), 240, 1000)
+        parameters["overlap_chars"] = clamp(round(int(parameters.get("overlap_chars", 48)) * 1.2), 24, 160)
+        chunking_reason = "더 작은 창과 약간 큰 겹침으로 인접 근거 회수 여부를 확인합니다."
+    elif candidate.chunking_strategy in {"hierarchical", "ocr_hierarchical"}:
+        parameters["max_section_chars"] = clamp(round(int(parameters.get("max_section_chars", 1200)) * 0.8), 500, 2000)
+        parameters["overlap_chars"] = clamp(round(int(parameters.get("overlap_chars", 80)) * 1.15), 24, 180)
+        chunking_reason = "구조 단위를 더 촘촘하게 나눠 절 경계의 영향만 비교합니다."
+    elif candidate.chunking_strategy == "table":
+        parameters["rows_per_chunk"] = clamp(int(parameters.get("rows_per_chunk", 6)) - 1, 2, 12)
+        chunking_reason = "표 행 묶음을 줄여 행 단위 근거 회수 여부를 확인합니다."
+    else:
+        parameters["target_chars"] = clamp(round(int(parameters.get("target_chars", 520)) * 0.85), 320, 1200)
+        chunking_reason = "묶음 크기를 조정해 근거 밀도를 비교합니다."
+    retrieval = {
+        "bm25": "hybrid",
+        "dense": "hybrid_rerank",
+        "hybrid": "hybrid_rerank",
+        "hybrid_rerank": "hybrid",
+    }.get(candidate.retrieval_config, "hybrid")
+    return parameters, retrieval, chunking_reason
+
+
+def create_exploration_candidate(instance: RagInstance, document: Document, proposal: dict, exploration_id: str) -> Candidate:
+    parameters = proposal["chunking_parameters"]
+    full_segments = chunks_for_strategy(document, proposal["chunking_strategy"], parameters)
+    # Exploration is still a comparison activity. Reusing the documented
+    # bounded-sample rule prevents a small proposal budget from silently
+    # embedding an unbounded large source before explicit finalization.
+    segments = (
+        evenly_sample_segments(full_segments, document.comparison_chunk_threshold)
+        if document.comparison_scope == ComparisonScope.SAMPLE
+        else full_segments
+    )
+    candidate = Candidate(
+        id=new_id(),
+        document_id=document.id,
+        chunking_strategy=proposal["chunking_strategy"],
+        retrieval_config=proposal["retrieval_config"],
+        friendly_name=f"탐색 제안 · {proposal['base_friendly_name']}",
+        technical_description=proposal["technical_description"],
+        chunking_parameters=parameters,
+        selection_reason=proposal["selection_reason"],
+        segments=segments,
+        estimated_chunk_count=len(full_segments),
+        selected_chunk_count=len(segments),
+        comparison_scope=document.comparison_scope,
+        exploration_round_id=exploration_id,
+        parent_candidate_id=proposal["parent_candidate_id"],
+    )
+    # Register before indexing so model provenance accurately includes the
+    # retrieval configuration being prepared, just like the normal candidate
+    # creation path.
+    CANDIDATES[candidate.id] = candidate
+    document.candidate_ids.append(candidate.id)
+    instance.candidate_ids.append(candidate.id)
+    try:
+        candidate.preparation_state = CandidateState.PREPARING
+        prepare_candidate_index(instance, candidate)
+    except Exception as error:
+        candidate.preparation_state = CandidateState.FAILED
+        candidate.preparation_error = str(error)
+    else:
+        candidate.preparation_state = CandidateState.READY
+        candidate.prepared_at = datetime.now(UTC)
+    proposal["candidate_id"] = candidate.id
+    proposal["candidate_state"] = candidate.preparation_state
+    return candidate
+
+
 def prepare_candidate_index(instance: RagInstance, candidate: Candidate) -> None:
     batch = embed([segment.text for segment in candidate.segments], instance.embedding_model)
     candidate.vectors = {
@@ -978,6 +1292,19 @@ def prepare_candidate_index(instance: RagInstance, candidate: Candidate) -> None
     candidate.embedding_provider = batch.provider
     candidate.embedding_dimension = batch.dimension
     candidate.embedding_warning = batch.warning
+    document = instance.documents.get(candidate.document_id)
+    if document:
+        document.model_metadata = {
+            "version": MODEL_PROVENANCE_VERSION,
+            "embedding_model": instance.embedding_model,
+            "embedding_provider": batch.provider,
+            "embedding_dimension": batch.dimension,
+            "embedding_warning": batch.warning,
+            "retrieval_configs": sorted(
+                {CANDIDATES[candidate_id].retrieval_config for candidate_id in document.candidate_ids if candidate_id in CANDIDATES}
+            ),
+            "indexed_at": now(),
+        }
 
 
 def register_artifact(
@@ -1036,20 +1363,183 @@ def latest_round_for(instance_id: str) -> ComparisonRound | None:
     return max(rounds, key=lambda round_: round_.created_at) if rounds else None
 
 
-def feedback_signal(instance: RagInstance) -> dict:
-    negative = [item for item in FEEDBACK if item["instance_id"] == instance.id and item["rating"] < 0]
-    threshold = 3
-    document_ids = sorted({document_id for item in negative for document_id in item.get("document_ids", []) if document_id in instance.documents})
-    if not document_ids:
-        document_ids = [document.id for document in instance.documents.values() if document.finalized_candidate_id]
-    recommended = len(negative) >= threshold
+def feedback_age_weight(created_at: str) -> tuple[float, str]:
+    """Keep recency explicit instead of treating years-old feedback as current."""
+    try:
+        age_days = max(0, (datetime.now(UTC) - datetime.fromisoformat(created_at)).days)
+    except (TypeError, ValueError):
+        return 0.25, "UNKNOWN_TIMESTAMP"
+    if age_days <= 14:
+        return 1.0, "0_14_DAYS"
+    if age_days <= 60:
+        return 0.5, "15_60_DAYS"
+    return 0.25, "61_PLUS_DAYS"
+
+
+def answer_integrity_observations(instance: RagInstance) -> dict:
+    """Report stored answer facts, never inferred model-quality scores."""
+    answer_artifacts = [
+        artifact
+        for artifact_id in instance.artifact_ids
+        for artifact in [ARTIFACTS.get(artifact_id)]
+        if artifact and artifact.type == "ANSWER"
+    ]
+    counts = {
+        "answer_count": len(answer_artifacts),
+        "answer_artifact_ids": [artifact.id for artifact in answer_artifacts],
+        "ungrounded_count": 0,
+        "fallback_count": 0,
+        "missing_citation_count": 0,
+    }
+    affected_document_ids: set[str] = set()
+    for artifact in answer_artifacts:
+        generation = artifact.metadata.get("generation", {})
+        grounded = bool(artifact.metadata.get("grounded"))
+        citations = artifact.payload.get("citations", [])
+        problematic = False
+        if not grounded:
+            counts["ungrounded_count"] += 1
+            problematic = True
+        if generation.get("fallback"):
+            counts["fallback_count"] += 1
+            problematic = True
+        if grounded and not citations:
+            counts["missing_citation_count"] += 1
+            problematic = True
+        if problematic:
+            affected_document_ids.update(document_id for document_id in artifact.context_document_ids if document_id in instance.documents)
+    counts["integrity_event_count"] = counts["ungrounded_count"] + counts["fallback_count"] + counts["missing_citation_count"]
+    counts["affected_document_ids"] = sorted(affected_document_ids)
+    counts["interpretation"] = "저장된 grounded/fallback/citation 사실이며 모델 품질 점수가 아닙니다."
+    return counts
+
+
+def benchmark_provider_snapshot() -> dict:
+    if not BENCHMARK_RUNS:
+        return {
+            "available": False,
+            "status": "NOT_RUN",
+            "used_for_recommendation_score": False,
+            "reason": "실측 benchmark가 없어 모델 품질을 추천 점수에 사용하지 않습니다.",
+            "run": None,
+            "results": [],
+        }
+    latest = BENCHMARK_RUNS[-1]
+    results = [
+        {
+            "model_id": result.get("model_id"),
+            "status": result.get("status"),
+            "provider": result.get("provider"),
+            "dimension": result.get("dimension"),
+        }
+        for result in latest.get("results", [])
+    ]
+    release_evidence = bool(results) and all(
+        result["status"] == "COMPLETED" and "fallback" not in str(result["provider"]).lower()
+        for result in results
+    )
     return {
+        "available": True,
+        "status": "REAL_PROVIDER_EVIDENCE" if release_evidence else "NOT_RELEASE_EVIDENCE",
+        "used_for_recommendation_score": False,
+        "reason": (
+            "실제 provider benchmark 상태는 재튜닝 전 runtime 검토 정보로만 사용하며, 모델 품질 점수로 합산하지 않습니다."
+            if release_evidence
+            else "fallback·실패·부분 benchmark는 모델 품질 근거가 아니므로 추천 점수에 사용하지 않습니다."
+        ),
+        "run": {"id": latest.get("run", {}).get("id"), "created_at": latest.get("run", {}).get("created_at"), "corpus_label": latest.get("run", {}).get("corpus_label")},
+        "results": results,
+    }
+
+
+def feedback_signal(instance: RagInstance) -> dict:
+    """Persistable, explainable retuning recommendation with no synthetic quality claim."""
+    items = [item for item in FEEDBACK if item["instance_id"] == instance.id]
+    negative = [item for item in items if item["rating"] < 0]
+    positive = [item for item in items if item["rating"] > 0]
+    recency_buckets = {"0_14_DAYS": 0, "15_60_DAYS": 0, "61_PLUS_DAYS": 0, "UNKNOWN_TIMESTAMP": 0}
+    negative_weight = 0.0
+    target_document_ids: set[str] = set()
+    for item in negative:
+        weight, bucket = feedback_age_weight(item.get("created_at", ""))
+        negative_weight += weight
+        recency_buckets[bucket] += 1
+        target_document_ids.update(document_id for document_id in item.get("document_ids", []) if document_id in instance.documents)
+    observations = answer_integrity_observations(instance)
+    target_document_ids.update(observations["affected_document_ids"])
+    if not target_document_ids:
+        target_document_ids.update(document.id for document in instance.documents.values() if document.finalized_candidate_id)
+    feedback_trigger = negative_weight >= RETUNING_NEGATIVE_WEIGHT_THRESHOLD
+    integrity_trigger = observations["integrity_event_count"] >= RETUNING_INTEGRITY_EVENT_THRESHOLD
+    combined_trigger = bool(negative) and observations["integrity_event_count"] >= 1
+    reasons = []
+    if feedback_trigger:
+        reasons.append("RECENT_NEGATIVE_FEEDBACK_THRESHOLD")
+    if integrity_trigger:
+        reasons.append("ANSWER_INTEGRITY_EVENTS_THRESHOLD")
+    if combined_trigger and not (feedback_trigger or integrity_trigger):
+        reasons.append("FEEDBACK_AND_ANSWER_INTEGRITY")
+    benchmark = benchmark_provider_snapshot()
+    if benchmark["status"] != "REAL_PROVIDER_EVIDENCE":
+        reasons.append("BENCHMARK_NOT_QUALITY_EVIDENCE")
+    recommended = feedback_trigger or integrity_trigger or combined_trigger
+    return {
+        "version": RETUNING_SIGNAL_VERSION,
         "recommended": recommended,
         "negative_count": len(negative),
-        "threshold": threshold,
-        "eligible_document_ids": document_ids,
-        "message": "부정 피드백이 누적되어 재튜닝을 권장합니다." if recommended else f"부정 피드백 {max(threshold - len(negative), 0)}건이 더 쌓이면 재튜닝을 권장합니다.",
+        "positive_count": len(positive),
+        # Retained as a numeric field for first-slice clients; it now means
+        # recency-weighted negative feedback, not a fixed count of three.
+        "threshold": RETUNING_NEGATIVE_WEIGHT_THRESHOLD,
+        "threshold_details": {
+            "negative_feedback_weight": RETUNING_NEGATIVE_WEIGHT_THRESHOLD,
+            "answer_integrity_events": RETUNING_INTEGRITY_EVENT_THRESHOLD,
+            "combined_rule": "at least one negative feedback plus at least one stored integrity event",
+        },
+        "inputs": {
+            "feedback": {
+                "total": len(items),
+                "negative_count": len(negative),
+                "positive_count": len(positive),
+                "recency_buckets": recency_buckets,
+                "negative_recency_weight": round(negative_weight, 3),
+            },
+            "answer_integrity": observations,
+            "benchmark_provider": benchmark,
+        },
+        "recommendation_reasons": reasons,
+        "eligible_document_ids": sorted(target_document_ids),
+        "message": (
+            "저장된 피드백과 답변 무결성 신호를 바탕으로 재튜닝을 권장합니다."
+            if recommended
+            else "현재 저장된 피드백·답변 무결성 신호만으로는 재튜닝을 권장하지 않습니다."
+        ),
         "action": "START_RETUNE" if recommended else None,
+        "runtime_review": "VERIFY_BENCHMARK_AND_PROVIDER" if benchmark["status"] != "REAL_PROVIDER_EVIDENCE" else None,
+    }
+
+
+def retuning_baseline_snapshot(instance: RagInstance, document_ids: list[str]) -> dict:
+    """Freeze the prior chosen pipeline and observed evidence before destructive retuning."""
+    pipelines = []
+    for document_id in document_ids:
+        document = instance.documents[document_id]
+        candidate = CANDIDATES[document.finalized_candidate_id]
+        pipelines.append(
+            {
+                "document_id": document.id,
+                "filename": document.filename,
+                "pipeline": candidate_payload(candidate),
+                "comparison": comparison_plan_payload(document),
+                "full_reindex": full_reindex_payload(document),
+            }
+        )
+    return {
+        "version": RETUNING_SIGNAL_VERSION,
+        "captured_at": now(),
+        "document_ids": document_ids,
+        "selected_pipelines": pipelines,
+        "recommendation": feedback_signal(instance),
     }
 
 
@@ -1160,6 +1650,8 @@ def render_validated_generation(
     citations_by_segment_id: dict[str, dict],
 ) -> tuple[str, list[dict], list[list[str]]]:
     """Render model text only after every sentence has valid source IDs."""
+    if not generated.sentences:
+        raise GroundingValidationError("generated response requires at least one cited sentence")
     supplied_ids = set(citations_by_segment_id)
     used_ids: list[str] = []
     sentences: list[str] = []
@@ -1516,6 +2008,11 @@ def candidate_payload(candidate: Candidate) -> dict:
             "embedding_dimension": candidate.embedding_dimension,
             "warning": candidate.embedding_warning,
         },
+        "exploration": {
+            "round_id": candidate.exploration_round_id,
+            "parent_candidate_id": candidate.parent_candidate_id,
+            "archived": candidate.archived,
+        },
     }
 
 
@@ -1545,6 +2042,13 @@ def document_payload(document: Document) -> dict:
         "id": document.id,
         "filename": document.filename,
         "content_type": document.content_type,
+        "source": document.source_metadata,
+        "provenance": {
+            "source_version": SOURCE_PROVENANCE_VERSION,
+            "parser": document.parser_metadata,
+            "chunking": document.chunking_metadata,
+            "model": document.model_metadata,
+        },
         "profile": document.profile,
         "chunking_analysis": document.chunking_analysis,
         "parse_status": document.parse_status,
@@ -1553,16 +2057,27 @@ def document_payload(document: Document) -> dict:
         "processing_job_id": document.processing_job_id,
         "pipeline_mode": document.pipeline_mode,
         "comparison": comparison_plan_payload(document),
-        "full_reindex": {
-            "required": document.comparison_scope == ComparisonScope.SAMPLE,
-            "job_id": document.full_reindex_job_id,
-            "state": document.full_reindex_state,
-            "ready": document.full_reindex_state in {None, JobState.SUCCEEDED},
-        },
+        "full_reindex": full_reindex_payload(document),
         "segment_count": len(document.segments),
         "finalized_candidate_id": document.finalized_candidate_id,
         "created_at": document.created_at.isoformat(),
         "candidates": [candidate_payload(CANDIDATES[candidate_id]) for candidate_id in document.candidate_ids],
+    }
+
+
+def full_reindex_payload(document: Document) -> dict:
+    """One explicit search-eligibility contract for sampled finalized sources."""
+    state = document.full_reindex_state
+    ready = state in {None, JobState.SUCCEEDED}
+    failed = state in {JobState.FAILED, JobState.CANCELLED}
+    return {
+        "required": document.comparison_scope == ComparisonScope.SAMPLE,
+        "job_id": document.full_reindex_job_id,
+        "state": state,
+        "ready": ready,
+        "search_eligible": ready,
+        "search_policy": "BLOCK_UNTIL_FULL_INDEX_SUCCEEDED",
+        "next_action": "RETRY_FULL_REINDEX" if failed else ("WAIT_FOR_FULL_REINDEX" if not ready else None),
     }
 
 
@@ -1765,6 +2280,71 @@ def full_reindex_stages() -> list[dict]:
     ]
 
 
+def job_max_attempts() -> int:
+    try:
+        return max(1, int(os.getenv("RAG_JOB_MAX_ATTEMPTS", "3")))
+    except ValueError:
+        return 3
+
+
+def job_retry_backoff_seconds() -> int:
+    try:
+        return max(0, int(os.getenv("RAG_JOB_RETRY_BACKOFF_SECONDS", "0")))
+    except ValueError:
+        return 0
+
+
+def ensure_job_operational_fields(job: ProcessingJob) -> None:
+    if not job.idempotency_key:
+        scope = ",".join(sorted(job.document_ids))
+        job.idempotency_key = f"{job.kind}:{job.instance_id}:{scope}:{job.artifact_id or job.id}"
+    job.max_attempts = max(1, job.max_attempts or job_max_attempts())
+    job.retry_backoff_seconds = max(0, job.retry_backoff_seconds or job_retry_backoff_seconds())
+
+
+def worker_identity() -> str:
+    return os.getenv("RAG_WORKER_ID", f"{backend_name()}-worker")
+
+
+def claim_job_execution(job: ProcessingJob) -> bool:
+    """Durable in-process lease; duplicate adapter deliveries become no-ops."""
+    ensure_job_operational_fields(job)
+    if job.execution_status == "RUNNING":
+        return False
+    if job.state in {JobState.SUCCEEDED, JobState.FAILED, JobState.CANCELLED, JobState.DEAD_LETTER}:
+        return False
+    job.execution_status = "RUNNING"
+    job.execution_count += 1
+    job.worker_id = worker_identity()
+    job.last_heartbeat_at = datetime.now(UTC)
+    return True
+
+
+def complete_job_execution(job: ProcessingJob) -> None:
+    job.execution_status = "COMPLETE"
+    job.last_heartbeat_at = datetime.now(UTC)
+
+
+def mark_job_failure(job: ProcessingJob, error: Exception | str) -> None:
+    job.error_message = str(error)
+    job.completed_at = datetime.now(UTC)
+    job.last_heartbeat_at = datetime.now(UTC)
+    job.execution_status = "COMPLETE"
+    if job.attempt >= job.max_attempts:
+        job.state = JobState.DEAD_LETTER
+        job.dead_letter_reason = "MAX_ATTEMPTS_EXHAUSTED"
+        job.current_step = "재시도 한도를 초과해 dead-letter로 이동했습니다."
+    else:
+        job.state = JobState.FAILED
+        job.next_attempt_at = datetime.now(UTC).replace(microsecond=0) + timedelta(seconds=job.retry_backoff_seconds)
+
+
+def checkpoint(job: ProcessingJob) -> None:
+    job.last_heartbeat_at = datetime.now(UTC)
+    if job.cancel_requested:
+        raise JobCancelled()
+
+
 def complete_stage(job: ProcessingJob, key: str, state: JobState, current_step: str, completed: int) -> None:
     job.state = state
     job.current_step = current_step
@@ -1781,8 +2361,7 @@ class JobCancelled(Exception):
 
 
 def ensure_job_is_active(job: ProcessingJob) -> None:
-    if job.cancel_requested:
-        raise JobCancelled()
+    checkpoint(job)
 
 
 def fail_preparing_candidates(job: ProcessingJob, message: str) -> None:
@@ -1805,6 +2384,11 @@ def run_processing_job(job_id: str, mode: PipelineMode, reuse_source_document_id
     """Execute the local parser/candidate/index preparation outside the request."""
     try:
         with STATE_LOCK:
+            job = JOBS.get(job_id)
+            if not job or not claim_job_execution(job):
+                return
+            persist_state()
+        with STATE_LOCK:
             job = JOBS[job_id]
             ensure_job_is_active(job)
             instance = get_instance(job.instance_id)
@@ -1820,20 +2404,7 @@ def run_processing_job(job_id: str, mode: PipelineMode, reuse_source_document_id
             instance = get_instance(job.instance_id)
             for document_id in job.document_ids:
                 document = instance.documents[document_id]
-                parsed = extract_document(
-                    filename=document.filename,
-                    content_type=document.content_type,
-                    content=document.content,
-                    content_base64=document.raw_content_base64,
-                )
-                document.content = parsed.text
-                document.parser = parsed.parser
-                document.used_ocr = parsed.used_ocr
-                document.segments = split_segments(parsed.text)
-                document.chunking_analysis = analyze_document_for_chunking(document)
-                document.profile = document_profile(document, document.chunking_analysis)
-                configure_comparison_scope(document)
-                document.parse_status = "PARSED"
+                parse_document_from_stored_source(instance, document)
             job.comparison_plans = {
                 document_id: comparison_plan_payload(instance.documents[document_id])
                 for document_id in job.document_ids
@@ -1908,6 +2479,7 @@ def run_processing_job(job_id: str, mode: PipelineMode, reuse_source_document_id
                 raise RuntimeError("검색 후보를 하나도 준비하지 못했습니다.")
             complete_stage(job, "INDEXING", JobState.SUCCEEDED, "검색 준비가 완료되었어요.", 3)
             job.completed_at = datetime.now(UTC)
+            complete_job_execution(job)
             instance.status = (
                 InstanceStatus.READY
                 if all(document.finalized_candidate_id for document in instance.documents.values())
@@ -1919,6 +2491,17 @@ def run_processing_job(job_id: str, mode: PipelineMode, reuse_source_document_id
                 artifact.updated_at = datetime.now(UTC)
                 artifact.metadata["summary"] = "문서 파싱과 검색 준비가 완료되었습니다."
                 artifact.metadata["comparison_plans"] = job.comparison_plans
+                if job.kind == JobKind.REPARSE:
+                    artifact.metadata["reparse_completed_at"] = now()
+                    artifact.metadata["reparsed_provenance"] = {
+                        document_id: {
+                            "source": instance.documents[document_id].source_metadata,
+                            "parser": instance.documents[document_id].parser_metadata,
+                            "chunking": instance.documents[document_id].chunking_metadata,
+                            "model": instance.documents[document_id].model_metadata,
+                        }
+                        for document_id in job.document_ids
+                    }
             persist_state()
     except JobCancelled:
         with STATE_LOCK:
@@ -1927,6 +2510,7 @@ def run_processing_job(job_id: str, mode: PipelineMode, reuse_source_document_id
                 job.state = JobState.CANCELLED
                 job.current_step = "문서 준비를 중단했어요."
                 job.completed_at = datetime.now(UTC)
+                complete_job_execution(job)
                 fail_preparing_candidates(job, "문서 준비가 중단되었습니다.")
                 artifact = ARTIFACTS.get(job.artifact_id) if job.artifact_id else None
                 if artifact:
@@ -1938,21 +2522,26 @@ def run_processing_job(job_id: str, mode: PipelineMode, reuse_source_document_id
         with STATE_LOCK:
             job = JOBS.get(job_id)
             if job:
-                job.state = JobState.FAILED
                 job.current_step = "문서 준비를 마치지 못했어요."
-                job.error_message = str(error)
-                job.completed_at = datetime.now(UTC)
+                mark_job_failure(job, error)
                 fail_preparing_candidates(job, "문서 준비 중 오류가 발생했습니다.")
                 artifact = ARTIFACTS.get(job.artifact_id) if job.artifact_id else None
                 if artifact:
                     artifact.status = ArtifactStatus.FAILED
                     artifact.updated_at = datetime.now(UTC)
+                    if job.state == JobState.DEAD_LETTER:
+                        artifact.metadata["dead_letter"] = {"reason": job.dead_letter_reason, "at": now()}
                 persist_state()
 
 
 def run_full_reindex_job(job_id: str) -> None:
     """Build the production-sized index after a sampled comparison is chosen."""
     try:
+        with STATE_LOCK:
+            job = JOBS.get(job_id)
+            if not job or not claim_job_execution(job):
+                return
+            persist_state()
         with STATE_LOCK:
             job = JOBS[job_id]
             ensure_job_is_active(job)
@@ -1994,6 +2583,7 @@ def run_full_reindex_job(job_id: str) -> None:
                 document.full_reindex_state = JobState.SUCCEEDED
             complete_stage(job, "FULL_INDEXING", JobState.SUCCEEDED, "전체 문서 재인덱싱이 완료되었어요.", 2)
             job.completed_at = datetime.now(UTC)
+            complete_job_execution(job)
             artifact = ARTIFACTS.get(job.artifact_id) if job.artifact_id else None
             if artifact:
                 artifact.status = ArtifactStatus.READY
@@ -2011,6 +2601,7 @@ def run_full_reindex_job(job_id: str) -> None:
                 job.state = JobState.CANCELLED
                 job.current_step = "전체 문서 재인덱싱을 중단했어요."
                 job.completed_at = datetime.now(UTC)
+                complete_job_execution(job)
                 instance = INSTANCES.get(job.instance_id)
                 if instance:
                     for document_id in job.document_ids:
@@ -2026,10 +2617,8 @@ def run_full_reindex_job(job_id: str) -> None:
         with STATE_LOCK:
             job = JOBS.get(job_id)
             if job:
-                job.state = JobState.FAILED
                 job.current_step = "전체 문서 재인덱싱을 마치지 못했어요."
-                job.error_message = str(error)
-                job.completed_at = datetime.now(UTC)
+                mark_job_failure(job, error)
                 instance = INSTANCES.get(job.instance_id)
                 if instance:
                     for document_id in job.document_ids:
@@ -2040,20 +2629,58 @@ def run_full_reindex_job(job_id: str) -> None:
                     artifact.status = ArtifactStatus.FAILED
                     artifact.updated_at = datetime.now(UTC)
                     artifact.metadata["error"] = str(error)
+                    if job.state == JobState.DEAD_LETTER:
+                        artifact.metadata["dead_letter"] = {"reason": job.dead_letter_reason, "at": now()}
                 persist_state()
+
+
+def dispatch_job(job: ProcessingJob, run: Callable[[], None]) -> None:
+    """Record an adapter receipt before a worker can advance durable job state."""
+    ensure_job_operational_fields(job)
+    persist_state()
+    receipt = dispatch(job.id, job.idempotency_key, run)
+    job.dispatch_backend = receipt.backend
+    job.dispatch_message_id = receipt.message_id
+    job.dispatch_fallback_reason = receipt.fallback_reason
+    # A local worker persists this receipt as part of its durable claim. Do not
+    # contend for the lock here: a tiny test/document job must still be
+    # observable as queued or running when the request returns.
+    if receipt.backend != "thread":
+        persist_state()
 
 
 def start_processing_job(job: ProcessingJob, mode: PipelineMode, reuse_source_document_id: str | None = None) -> None:
     job.pipeline_mode = mode
     job.reuse_source_document_id = reuse_source_document_id
-    dispatch(
-        job.id,
+    dispatch_job(
+        job,
         lambda: run_processing_job(job.id, job.pipeline_mode, job.reuse_source_document_id),
     )
 
 
 def start_full_reindex_job(job: ProcessingJob) -> None:
-    dispatch(job.id, lambda: run_full_reindex_job(job.id))
+    dispatch_job(job, lambda: run_full_reindex_job(job.id))
+
+
+def consume_dispatched_job(job_id: str, idempotency_key: str) -> bool:
+    """Worker adapter contract for Redis/SQS consumers.
+
+    A consumer passes the two fields in the queue message. The durable claim in
+    each runner makes duplicate delivery harmless and preserves the same work
+    path used by the local thread fallback.
+    """
+    with STATE_LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            return False
+        ensure_job_operational_fields(job)
+        if job.idempotency_key != idempotency_key:
+            return False
+    if job.kind == JobKind.FULL_REINDEX:
+        run_full_reindex_job(job.id)
+    else:
+        run_processing_job(job.id, job.pipeline_mode, job.reuse_source_document_id)
+    return True
 
 
 def resume_pending_jobs() -> None:
@@ -2144,6 +2771,13 @@ def upload_documents(instance_id: str, body: DocumentsCreate) -> dict:
             parse_status="UPLOADED",
         )
         document.pipeline_mode = mode
+        try:
+            store_document_source(instance, document, decode_source(item.content, item.content_base64))
+        except SourceStorageError as error:
+            raise HTTPException(
+                503,
+                detail={"code": "SOURCE_STORAGE_UNAVAILABLE", "message": "원본 파일을 재현 가능 저장소에 보관하지 못했습니다.", "details": {"error": str(error)}},
+            ) from error
         # Text uploads can expose their comparison cost immediately. Binary
         # sources are authoritatively recalculated after the async parser runs.
         if item.content:
@@ -2164,6 +2798,7 @@ def upload_documents(instance_id: str, body: DocumentsCreate) -> dict:
             "context_status": "AVAILABLE",
             "summary": "문서 준비를 시작했어요.",
             "comparison_plans": {document.id: comparison_plan_payload(document) for document in created},
+            "sources": {document.id: document.source_metadata for document in created},
         },
         artifact_status=ArtifactStatus.PROCESSING,
     )
@@ -2200,6 +2835,90 @@ def upload_documents(instance_id: str, body: DocumentsCreate) -> dict:
     return {"job": job_payload(job), "artifact": artifact_payload(artifact), "decision": decision, "documents": [document_payload(item) for item in created]}
 
 
+@app.post(f"{API_PREFIX}/rag-instances/{{instance_id}}/documents/{{document_id}}/reparse", status_code=status.HTTP_202_ACCEPTED)
+def reparse_document(instance_id: str, document_id: str, body: ReparseRequest) -> dict:
+    """Re-run parser/candidate preparation from the immutable stored source."""
+    instance = get_instance(instance_id)
+    document = instance.documents.get(document_id)
+    if not document:
+        raise not_found("문서")
+    if not document.source_metadata.get("storage_key"):
+        raise HTTPException(
+            409,
+            detail={"code": "SOURCE_PROVENANCE_UNAVAILABLE", "message": "이 레거시 문서에는 재현 가능한 원본 저장소 참조가 없습니다. 원본 파일을 다시 업로드해 주세요."},
+        )
+    if document.processing_job_id:
+        active = JOBS.get(document.processing_job_id)
+        if active and active.state in {JobState.QUEUED, JobState.PARSING, JobState.GENERATING_CANDIDATES, JobState.INDEXING}:
+            raise HTTPException(409, detail={"code": "DOCUMENT_PROCESSING", "message": "이미 문서 처리 작업이 진행 중입니다."})
+    baseline = {
+        "version": SOURCE_PROVENANCE_VERSION,
+        "captured_at": now(),
+        "document": document_payload(document),
+        "reason": body.reason,
+    }
+    baseline_artifact = register_artifact(
+        instance,
+        type="REPARSE_BASELINE",
+        title=f"{document.filename} 재파싱 전 기준선",
+        context_document_ids=[document.id],
+        metadata={"context_status": "AVAILABLE", "summary": "기존 원본·parser·chunking·model provenance를 보존했습니다."},
+        payload=baseline,
+    )
+    for candidate_id in list(document.candidate_ids):
+        CANDIDATES.pop(candidate_id, None)
+        if candidate_id in instance.candidate_ids:
+            instance.candidate_ids.remove(candidate_id)
+    document.candidate_ids = []
+    document.finalized_candidate_id = None
+    document.full_reindex_job_id = None
+    document.full_reindex_state = None
+    document.pipeline_mode = PipelineMode.RETUNE
+    document.parse_status = "UPLOADED"
+    document.segments = []
+    instance.status = InstanceStatus.SETTING_UP
+    artifact = register_artifact(
+        instance,
+        type="REPARSE_RUN",
+        title=f"{document.filename} 원본 재파싱",
+        context_document_ids=[document.id],
+        metadata={
+            "context_status": "AVAILABLE",
+            "reason": body.reason,
+            "baseline_artifact_id": baseline_artifact.id,
+            "source": document.source_metadata,
+            "summary": "저장된 원본 파일로 parser와 검색 후보를 다시 준비하고 있어요.",
+        },
+        artifact_status=ArtifactStatus.PROCESSING,
+    )
+    job = ProcessingJob(
+        id=new_id(),
+        instance_id=instance.id,
+        document_ids=[document.id],
+        state=JobState.QUEUED,
+        current_step="저장된 원본 파일 재파싱을 시작할 예정이에요.",
+        completed_units=0,
+        total_units=3,
+        created_at=datetime.now(UTC),
+        stages=job_stages(PipelineMode.RETUNE),
+        artifact_id=artifact.id,
+        pipeline_mode=PipelineMode.RETUNE,
+        kind=JobKind.REPARSE,
+        comparison_plans={document.id: comparison_plan_payload(document)},
+    )
+    JOBS[job.id] = job
+    document.processing_job_id = job.id
+    persist_state()
+    start_processing_job(job, PipelineMode.RETUNE)
+    return {
+        "job": job_payload(job),
+        "artifact": artifact_payload(artifact),
+        "baseline_artifact": artifact_payload(baseline_artifact),
+        "document": document_payload(document),
+        "next_action": "TUNE_DOCUMENT",
+    }
+
+
 def job_has_failed_candidates(job: ProcessingJob) -> bool:
     instance = INSTANCES.get(job.instance_id)
     if not instance:
@@ -2214,8 +2933,57 @@ def job_has_failed_candidates(job: ProcessingJob) -> bool:
     )
 
 
+def job_can_retry(job: ProcessingJob) -> bool:
+    ensure_job_operational_fields(job)
+    if job.state == JobState.DEAD_LETTER or job.attempt >= job.max_attempts:
+        return False
+    if job.next_attempt_at and job.next_attempt_at > datetime.now(UTC):
+        return False
+    return job.state in {JobState.FAILED, JobState.CANCELLED} or job_has_failed_candidates(job)
+
+
 def job_payload(job: ProcessingJob) -> dict:
-    return {"id": job.id, "instance_id": job.instance_id, "document_ids": job.document_ids, "kind": job.kind, "state": job.state, "current_step": job.current_step, "progress": {"completed": job.completed_units, "total": job.total_units}, "stages": job.stages, "artifact_id": job.artifact_id, "comparison_plans": job.comparison_plans, "can_retry": job.state in {JobState.FAILED, JobState.CANCELLED} or job_has_failed_candidates(job), "can_cancel": job.state in {JobState.QUEUED, JobState.PARSING, JobState.GENERATING_CANDIDATES, JobState.INDEXING}, "attempt": job.attempt, "queue_backend": backend_name(), "created_at": job.created_at.isoformat(), "completed_at": job.completed_at.isoformat() if job.completed_at else None, "error_message": job.error_message}
+    ensure_job_operational_fields(job)
+    return {
+        "id": job.id, "instance_id": job.instance_id, "document_ids": job.document_ids,
+        "kind": job.kind, "state": job.state, "current_step": job.current_step,
+        "progress": {"completed": job.completed_units, "total": job.total_units},
+        "stages": job.stages, "artifact_id": job.artifact_id, "comparison_plans": job.comparison_plans,
+        "can_retry": job_can_retry(job), "can_recover": job.state == JobState.DEAD_LETTER,
+        "can_cancel": job.state in {JobState.QUEUED, JobState.PARSING, JobState.GENERATING_CANDIDATES, JobState.INDEXING},
+        "attempt": job.attempt, "queue_backend": backend_name(),
+        "created_at": job.created_at.isoformat(), "completed_at": job.completed_at.isoformat() if job.completed_at else None,
+        "error_message": job.error_message,
+        "operational": {
+            "idempotency_key": job.idempotency_key,
+            "dispatch": {"backend": job.dispatch_backend, "message_id": job.dispatch_message_id, "fallback_reason": job.dispatch_fallback_reason},
+            "execution": {"status": job.execution_status, "count": job.execution_count, "worker_id": job.worker_id, "last_heartbeat_at": job.last_heartbeat_at.isoformat() if job.last_heartbeat_at else None},
+            "retry": {"max_attempts": job.max_attempts, "backoff_seconds": job.retry_backoff_seconds, "next_attempt_at": job.next_attempt_at.isoformat() if job.next_attempt_at else None},
+            "dead_letter_reason": job.dead_letter_reason,
+        },
+    }
+
+
+@app.get(f"{API_PREFIX}/job-platform")
+def job_platform() -> dict:
+    states = Counter(str(job.state) for job in JOBS.values())
+    workers = sorted(
+        ({"worker_id": job.worker_id, "last_heartbeat_at": job.last_heartbeat_at.isoformat() if job.last_heartbeat_at else None, "job_id": job.id}
+         for job in JOBS.values() if job.worker_id),
+        key=lambda item: item["last_heartbeat_at"] or "", reverse=True,
+    )
+    return {
+        "queue": queue_observability(),
+        "jobs_by_state": dict(states),
+        "dead_letter_count": states.get(str(JobState.DEAD_LETTER), 0),
+        "workers": workers,
+    }
+
+
+@app.get(f"{API_PREFIX}/rag-jobs/dead-letters")
+def list_dead_letters() -> dict:
+    jobs = sorted((job for job in JOBS.values() if job.state == JobState.DEAD_LETTER), key=lambda job: job.completed_at or job.created_at, reverse=True)
+    return {"items": [job_payload(job) for job in jobs], "total": len(jobs)}
 
 
 @app.get(f"{API_PREFIX}/rag-jobs/{{job_id}}")
@@ -2244,6 +3012,15 @@ def retry_job(job_id: str) -> dict:
     job = JOBS.get(job_id)
     if not job:
         raise not_found("작업")
+    ensure_job_operational_fields(job)
+    if job.state == JobState.DEAD_LETTER:
+        raise HTTPException(409, detail={"code": "JOB_IN_DEAD_LETTER", "message": "dead-letter 작업은 복구 API로 다시 실행할 수 있습니다."})
+    if job.next_attempt_at and job.next_attempt_at > datetime.now(UTC):
+        raise HTTPException(409, detail={"code": "JOB_RETRY_BACKOFF", "message": "설정된 재시도 대기 시간이 끝난 뒤 다시 시도할 수 있습니다.", "next_attempt_at": job.next_attempt_at.isoformat()})
+    if job.attempt >= job.max_attempts:
+        mark_job_failure(job, job.error_message or "재시도 한도를 초과했습니다.")
+        persist_state()
+        raise HTTPException(409, detail={"code": "JOB_RETRY_LIMIT", "message": "재시도 한도를 초과해 dead-letter로 이동했습니다."})
     if job.state not in {JobState.FAILED, JobState.CANCELLED} and not job_has_failed_candidates(job):
         raise HTTPException(409, detail={"code": "JOB_NOT_RETRYABLE", "message": "실패·중단되었거나 후보 준비에 실패한 작업만 다시 시도할 수 있습니다."})
     instance = get_instance(job.instance_id)
@@ -2258,6 +3035,9 @@ def retry_job(job_id: str) -> dict:
         job.error_message = None
         job.cancel_requested = False
         job.attempt += 1
+        job.next_attempt_at = None
+        job.dead_letter_reason = None
+        job.execution_status = "IDLE"
         job.stages = full_reindex_stages()
         persist_state()
         start_full_reindex_job(job)
@@ -2286,10 +3066,31 @@ def retry_job(job_id: str) -> dict:
     job.error_message = None
     job.cancel_requested = False
     job.attempt += 1
+    job.next_attempt_at = None
+    job.dead_letter_reason = None
+    job.execution_status = "IDLE"
     job.stages = job_stages(job.pipeline_mode)
     persist_state()
     start_processing_job(job, job.pipeline_mode, job.reuse_source_document_id)
     return job_payload(job)
+
+
+@app.post(f"{API_PREFIX}/rag-jobs/{{job_id}}/recover")
+def recover_dead_letter(job_id: str) -> dict:
+    """Operator-only recovery resets the retry budget and reuses the normal path."""
+    job = JOBS.get(job_id)
+    if not job:
+        raise not_found("작업")
+    if job.state != JobState.DEAD_LETTER:
+        raise HTTPException(409, detail={"code": "JOB_NOT_DEAD_LETTER", "message": "dead-letter 상태의 작업만 복구할 수 있습니다."})
+    job.state = JobState.FAILED
+    job.attempt = 0
+    job.dead_letter_reason = None
+    job.next_attempt_at = None
+    job.execution_status = "IDLE"
+    job.current_step = "운영자가 dead-letter 작업 복구를 요청했어요."
+    persist_state()
+    return retry_job(job_id)
 
 
 @app.get(f"{API_PREFIX}/rag-instances/{{instance_id}}/jobs")
@@ -2317,13 +3118,319 @@ def document_add_options(instance_id: str) -> dict:
     }
 
 
+def latest_retuning_run(instance: RagInstance, document_ids: list[str]) -> Artifact | None:
+    expected = set(document_ids)
+    runs = [
+        artifact
+        for artifact_id in instance.artifact_ids
+        for artifact in [ARTIFACTS.get(artifact_id)]
+        if artifact
+        and artifact.type == "RETUNING_RUN"
+        and set(artifact.context_document_ids) == expected
+        and artifact.metadata.get("baseline_artifact_id")
+    ]
+    return max(runs, key=lambda artifact: artifact.created_at) if runs else None
+
+
+def retuning_comparison_observations(results: list[dict]) -> dict:
+    """Comparable facts from a retune comparison, deliberately not a quality score."""
+    generation = [result.get("generation", {}) for result in results]
+    return {
+        "candidate_count": len(results),
+        "ready_count": sum(result.get("candidate_state") == CandidateState.READY for result in results),
+        "no_evidence_count": sum(result.get("candidate_state") == CandidateState.NO_EVIDENCE for result in results),
+        "grounded_count": sum(bool(result.get("grounded")) for result in results),
+        "fallback_count": sum(bool(item.get("fallback")) for item in generation),
+        "citation_count": sum(len(result.get("citations", [])) for result in results),
+        "providers": sorted({item.get("provider") for item in generation if item.get("provider")}),
+        "interpretation": "후보 비교에서 관찰된 검색·grounding 사실이며, 모델 품질 순위나 개선 보장은 아닙니다.",
+    }
+
+
+def create_retuning_outcome_artifact(
+    instance: RagInstance,
+    document_ids: list[str],
+    round_: ComparisonRound,
+    results: list[dict],
+) -> Artifact | None:
+    retuning_run = latest_retuning_run(instance, document_ids)
+    if not retuning_run:
+        return None
+    baseline_id = retuning_run.metadata["baseline_artifact_id"]
+    baseline = ARTIFACTS.get(baseline_id)
+    if not baseline:
+        return None
+    observations = retuning_comparison_observations(results)
+    outcome = register_artifact(
+        instance,
+        type="RETUNING_OUTCOME",
+        title="재튜닝 비교 결과",
+        context_document_ids=document_ids,
+        metadata={
+            "context_status": "AVAILABLE",
+            "baseline_artifact_id": baseline_id,
+            "retuning_run_artifact_id": retuning_run.id,
+            "round_id": round_.id,
+            "signal_version": RETUNING_SIGNAL_VERSION,
+            "selection_state": "PENDING_USER_VOTE",
+            "summary": "기준선과 새 후보의 관측값을 함께 저장했습니다. 사용자 투표와 확정 전에는 개선을 주장하지 않습니다.",
+            "comparison_observations": observations,
+        },
+        payload={
+            "baseline": baseline.payload,
+            "question": round_.question,
+            "comparison_observations": observations,
+            "candidates": [
+                {
+                    "candidate": result["candidate"],
+                    "candidate_state": result["candidate_state"],
+                    "relevance": result["relevance"],
+                    "grounded": result["grounded"],
+                    "citation_count": len(result.get("citations", [])),
+                    "generation": result.get("generation", {}),
+                }
+                for result in results
+            ],
+        },
+    )
+    retuning_run.metadata["outcome_artifact_id"] = outcome.id
+    retuning_run.updated_at = datetime.now(UTC)
+    return outcome
+
+
+def candidate_exploration_payload(exploration: CandidateExploration) -> dict:
+    pool = [candidate_payload(CANDIDATES[candidate_id]) for candidate_id in exploration.candidate_pool_ids if candidate_id in CANDIDATES]
+    proposals = []
+    for proposal in exploration.proposals:
+        candidate = CANDIDATES.get(proposal.get("candidate_id"))
+        proposals.append({**proposal, "candidate": candidate_payload(candidate) if candidate else None})
+    return {
+        "id": exploration.id,
+        "instance_id": exploration.instance_id,
+        "document_ids": exploration.document_ids,
+        "question": exploration.question,
+        "status": exploration.status,
+        "created_at": exploration.created_at.isoformat(),
+        "pool": pool,
+        "pool_candidate_ids": exploration.candidate_pool_ids,
+        "narrowed_candidate_ids": exploration.narrowed_candidate_ids,
+        "proposed": proposals,
+        "rationale": exploration.rationale,
+        "ledger": exploration.ledger,
+        "rollback": {
+            "supported": True,
+            "status": exploration.status,
+            "restore_supported": exploration.status == ExplorationStatus.ROLLED_BACK,
+            "note": "제안 후보만 보관/복원하며 기존 후보·투표·확정 결과를 자동 변경하지 않습니다.",
+        },
+        "selection": {
+            "automatic": False,
+            "finalized_candidate_ids": [
+                instance_document.finalized_candidate_id
+                for instance_document in get_instance(exploration.instance_id).documents.values()
+                if instance_document.finalized_candidate_id
+            ],
+            "message": "탐색은 후보 제안과 관측 기록만 수행합니다. 비교·투표·확정은 기존 명시적 흐름으로 진행하세요.",
+        },
+        "artifact_id": exploration.artifact_id,
+    }
+
+
+def exploration_source_provenance(instance: RagInstance, document_ids: list[str]) -> dict:
+    return {
+        document_id: {
+            "source": instance.documents[document_id].source_metadata,
+            "parser": instance.documents[document_id].parser_metadata,
+            "chunking": instance.documents[document_id].chunking_metadata,
+            "model": instance.documents[document_id].model_metadata,
+        }
+        for document_id in document_ids
+    }
+
+
+@app.post(f"{API_PREFIX}/rag-instances/{{instance_id}}/candidate-exploration", status_code=status.HTTP_201_CREATED)
+def start_candidate_exploration(instance_id: str, body: CandidateExplorationRequest) -> dict:
+    instance = get_instance(instance_id)
+    missing = [document_id for document_id in body.document_ids if document_id not in instance.documents]
+    if missing:
+        raise HTTPException(422, detail={"code": "DOCUMENT_NOT_IN_INSTANCE", "message": "선택한 문서가 이 RAG에 없습니다.", "details": {"document_ids": missing}})
+    pool_candidates = [
+        CANDIDATES[candidate_id]
+        for document_id in body.document_ids
+        for candidate_id in instance.documents[document_id].candidate_ids
+        if candidate_id in CANDIDATES and not CANDIDATES[candidate_id].archived
+    ]
+    if not pool_candidates:
+        raise HTTPException(409, detail={"code": "EXPLORATION_POOL_EMPTY", "message": "탐색할 준비된 후보 풀이 없습니다. 문서 처리가 끝난 뒤 다시 시도하세요."})
+    signal_map = {candidate.id: exploration_signals(candidate) for candidate in pool_candidates}
+    ranked = sorted(pool_candidates, key=lambda candidate: (-signal_map[candidate.id]["priority"], candidate.id))
+    narrowed: list[Candidate] = []
+    # Give every requested document one transparent chance before filling the
+    # remaining bounded exploration budget.
+    for document_id in body.document_ids:
+        candidate = next((item for item in ranked if item.document_id == document_id), None)
+        if candidate and candidate not in narrowed:
+            narrowed.append(candidate)
+    for candidate in ranked:
+        if len(narrowed) >= body.max_proposals:
+            break
+        if candidate not in narrowed:
+            narrowed.append(candidate)
+    narrowed = narrowed[:body.max_proposals]
+    exploration = CandidateExploration(
+        id=new_id(),
+        instance_id=instance.id,
+        document_ids=body.document_ids,
+        created_at=datetime.now(UTC),
+        question=body.question,
+        max_proposals=body.max_proposals,
+        candidate_pool_ids=[candidate.id for candidate in pool_candidates],
+        narrowed_candidate_ids=[candidate.id for candidate in narrowed],
+        rationale=[
+            {
+                "candidate_id": candidate.id,
+                "signals": signal_map[candidate.id],
+                "reason": "준비 상태·기존 사용자 투표·비교 근거 관측값을 기준으로 제한된 탐색 풀에 포함했습니다.",
+            }
+            for candidate in ranked
+        ],
+        ledger=[{"at": now(), "event": "POOL_EVALUATED", "candidate_count": len(pool_candidates), "max_proposals": body.max_proposals}],
+    )
+    for parent in narrowed:
+        document = instance.documents[parent.document_id]
+        parameters, retrieval, chunking_reason = exploration_variant(parent)
+        proposal = {
+            "parent_candidate_id": parent.id,
+            "base_friendly_name": parent.friendly_name,
+            "document_id": document.id,
+            "chunking_strategy": parent.chunking_strategy,
+            "chunking_parameters": parameters,
+            "retrieval_config": retrieval,
+            "selection_reason": f"탐색 제안: {chunking_reason} 검색은 {parent.retrieval_config}에서 {retrieval}로만 바꿔 비교합니다.",
+            "technical_description": f"Adaptive exploration variant of {parent.id}: {chunking_reason}",
+            "rationale": {
+                "parent_signals": signal_map[parent.id],
+                "parameter_change_reason": chunking_reason,
+                "retrieval_change": {"from": parent.retrieval_config, "to": retrieval},
+                "automatic_selection": False,
+            },
+        }
+        create_exploration_candidate(instance, document, proposal, exploration.id)
+        exploration.proposals.append(proposal)
+    exploration.ledger.append({"at": now(), "event": "PROPOSALS_CREATED", "proposal_candidate_ids": [proposal["candidate_id"] for proposal in exploration.proposals]})
+    artifact = register_artifact(
+        instance,
+        type="ADAPTIVE_EXPLORATION",
+        title="적응형 후보 탐색",
+        context_document_ids=body.document_ids,
+        metadata={
+            "context_status": "AVAILABLE",
+            "exploration_id": exploration.id,
+            "signal_version": "adaptive-exploration.v1",
+            "automatic_selection": False,
+            "summary": "후보 풀의 제한된 운영·비교 신호를 기록해 변형 후보를 제안했습니다. 이 기록은 품질 순위나 자동 확정이 아닙니다.",
+            "source_provenance": exploration_source_provenance(instance, body.document_ids),
+        },
+        payload={"candidate_exploration": candidate_exploration_payload(exploration)},
+    )
+    exploration.artifact_id = artifact.id
+    artifact.payload["candidate_exploration"] = candidate_exploration_payload(exploration)
+    EXPLORATIONS[exploration.id] = exploration
+    persist_state()
+    return {"candidate_exploration": candidate_exploration_payload(exploration), "artifact": artifact_payload(artifact)}
+
+
+@app.get(f"{API_PREFIX}/rag-instances/{{instance_id}}/candidate-exploration")
+def list_candidate_explorations(instance_id: str) -> dict:
+    get_instance(instance_id)
+    items = sorted((item for item in EXPLORATIONS.values() if item.instance_id == instance_id), key=lambda item: item.created_at, reverse=True)
+    return {"items": [candidate_exploration_payload(item) for item in items], "total": len(items)}
+
+
+@app.get(f"{API_PREFIX}/candidate-exploration/{{exploration_id}}")
+def get_candidate_exploration(exploration_id: str) -> dict:
+    exploration = EXPLORATIONS.get(exploration_id)
+    if not exploration:
+        raise not_found("후보 탐색")
+    return {"candidate_exploration": candidate_exploration_payload(exploration)}
+
+
+@app.post(f"{API_PREFIX}/candidate-exploration/{{exploration_id}}/rollback")
+def rollback_candidate_exploration(exploration_id: str) -> dict:
+    exploration = EXPLORATIONS.get(exploration_id)
+    if not exploration:
+        raise not_found("후보 탐색")
+    if exploration.status == ExplorationStatus.ROLLED_BACK:
+        raise HTTPException(409, detail={"code": "EXPLORATION_ALREADY_ROLLED_BACK", "message": "이미 롤백된 탐색입니다."})
+    instance = get_instance(exploration.instance_id)
+    archived_ids = []
+    for proposal in exploration.proposals:
+        candidate = CANDIDATES.get(proposal.get("candidate_id"))
+        if not candidate or candidate.exploration_round_id != exploration.id:
+            continue
+        candidate.archived = True
+        document = instance.documents.get(candidate.document_id)
+        if document and candidate.id in document.candidate_ids:
+            document.candidate_ids.remove(candidate.id)
+        if candidate.id in instance.candidate_ids:
+            instance.candidate_ids.remove(candidate.id)
+        archived_ids.append(candidate.id)
+    exploration.status = ExplorationStatus.ROLLED_BACK
+    exploration.ledger.append({"at": now(), "event": "ROLLED_BACK", "candidate_ids": archived_ids, "automatic_selection": False})
+    if exploration.artifact_id and (artifact := ARTIFACTS.get(exploration.artifact_id)):
+        artifact.metadata["status"] = "ROLLED_BACK"
+        artifact.metadata["rollback_candidate_ids"] = archived_ids
+        artifact.updated_at = datetime.now(UTC)
+    persist_state()
+    return {"candidate_exploration": candidate_exploration_payload(exploration), "archived_candidate_ids": archived_ids}
+
+
+@app.post(f"{API_PREFIX}/candidate-exploration/{{exploration_id}}/restore")
+def restore_candidate_exploration(exploration_id: str) -> dict:
+    exploration = EXPLORATIONS.get(exploration_id)
+    if not exploration:
+        raise not_found("후보 탐색")
+    if exploration.status != ExplorationStatus.ROLLED_BACK:
+        raise HTTPException(409, detail={"code": "EXPLORATION_NOT_ROLLED_BACK", "message": "롤백된 탐색만 복원할 수 있습니다."})
+    instance = get_instance(exploration.instance_id)
+    restored_ids = []
+    for proposal in exploration.proposals:
+        candidate = CANDIDATES.get(proposal.get("candidate_id"))
+        if candidate and candidate.exploration_round_id == exploration.id:
+            candidate.archived = False
+            document = instance.documents.get(candidate.document_id)
+            if document and candidate.id not in document.candidate_ids:
+                document.candidate_ids.append(candidate.id)
+            if candidate.id not in instance.candidate_ids:
+                instance.candidate_ids.append(candidate.id)
+            restored_ids.append(candidate.id)
+            continue
+        document = instance.documents.get(proposal["document_id"])
+        if not document:
+            continue
+        restored = create_exploration_candidate(instance, document, proposal, exploration.id)
+        restored_ids.append(restored.id)
+    exploration.status = ExplorationStatus.RESTORED
+    exploration.ledger.append({"at": now(), "event": "RESTORED", "candidate_ids": restored_ids, "automatic_selection": False})
+    if exploration.artifact_id and (artifact := ARTIFACTS.get(exploration.artifact_id)):
+        artifact.metadata["status"] = "RESTORED"
+        artifact.updated_at = datetime.now(UTC)
+    persist_state()
+    return {"candidate_exploration": candidate_exploration_payload(exploration), "restored_candidate_ids": restored_ids}
+
+
 @app.post(f"{API_PREFIX}/rag-instances/{{instance_id}}/tuning/compare")
 def compare_candidates(instance_id: str, body: CompareRequest) -> dict:
     instance = get_instance(instance_id)
     missing = [document_id for document_id in body.document_ids if document_id not in instance.documents]
     if missing:
         raise HTTPException(422, detail={"code": "DOCUMENT_NOT_IN_INSTANCE", "message": "선택한 문서가 이 RAG에 없습니다.", "details": {"document_ids": missing}})
-    candidate_ids = [candidate_id for document_id in body.document_ids for candidate_id in instance.documents[document_id].candidate_ids if not CANDIDATES[candidate_id].finalized or True]
+    candidate_ids = [
+        candidate_id
+        for document_id in body.document_ids
+        for candidate_id in instance.documents[document_id].candidate_ids
+        if candidate_id in CANDIDATES and not CANDIDATES[candidate_id].archived
+    ]
     round_ = ComparisonRound(id=new_id(), instance_id=instance.id, document_ids=body.document_ids, question=body.question, candidate_ids=candidate_ids, created_at=datetime.now(UTC))
     ROUNDS[round_.id] = round_
     results = comparison_results(instance, round_)
@@ -2346,8 +3453,15 @@ def compare_candidates(instance_id: str, body: CompareRequest) -> dict:
         },
         payload={"question": body.question, "candidate_ids": candidate_ids},
     )
+    retuning_outcome = create_retuning_outcome_artifact(instance, body.document_ids, round_, results)
     persist_state()
-    return {"round": round_payload(round_), "artifact": artifact_payload(artifact), "results": results, "view": {"default": "answer_with_inline_citations", "alternate": "source_chunks"}}
+    return {
+        "round": round_payload(round_),
+        "artifact": artifact_payload(artifact),
+        "retuning_outcome_artifact": artifact_payload(retuning_outcome) if retuning_outcome else None,
+        "results": results,
+        "view": {"default": "answer_with_inline_citations", "alternate": "source_chunks"},
+    }
 
 
 def round_payload(round_: ComparisonRound) -> dict:
@@ -2485,6 +3599,23 @@ def get_tuning_status(instance_id: str, document_ids: list[str] = Query(...)) ->
     return tuning_status(instance, document_ids)
 
 
+def finalize_retuning_outcomes(instance: RagInstance, document: Document, winner: Candidate) -> None:
+    """Close comparable retuning evidence only when its new pipeline is selected."""
+    for artifact_id in instance.artifact_ids:
+        artifact = ARTIFACTS.get(artifact_id)
+        if not artifact or artifact.type != "RETUNING_OUTCOME" or document.id not in artifact.context_document_ids:
+            continue
+        selected = artifact.metadata.setdefault("selected_pipelines", {})
+        if document.id in selected:
+            continue
+        selected[document.id] = candidate_payload(winner)
+        pending = set(artifact.context_document_ids) - set(selected)
+        artifact.metadata["selection_state"] = "FINALIZED" if not pending else "PARTIALLY_FINALIZED"
+        artifact.metadata["pending_document_ids"] = sorted(pending)
+        artifact.metadata["summary"] = "재튜닝 후 선택한 파이프라인을 기준선과 비교할 수 있습니다. 관측값은 모델 품질 보장이 아닙니다."
+        artifact.updated_at = datetime.now(UTC)
+
+
 @app.post(f"{API_PREFIX}/rag-instances/{{instance_id}}/tuning/finalize")
 def finalize(instance_id: str, body: FinalizeRequest) -> dict:
     instance = get_instance(instance_id)
@@ -2504,6 +3635,7 @@ def finalize(instance_id: str, body: FinalizeRequest) -> dict:
             instance.candidate_ids.remove(candidate.id)
             document.candidate_ids.remove(candidate.id)
     document.finalized_candidate_id = winner.id
+    finalize_retuning_outcomes(instance, document, winner)
     instance.status = InstanceStatus.READY if all(item.finalized_candidate_id for item in instance.documents.values()) else InstanceStatus.TUNING
     artifact = register_artifact(
         instance,
@@ -2525,33 +3657,115 @@ def finalize(instance_id: str, body: FinalizeRequest) -> dict:
         "finalized_candidate": candidate_payload(winner),
         "artifact": artifact_payload(artifact),
         "full_reindex": (
-            {"required": True, "job": job_payload(reindex[0]), "artifact": artifact_payload(reindex[1])}
+            {
+                **full_reindex_payload(document),
+                "job": job_payload(reindex[0]),
+                "artifact": artifact_payload(reindex[1]),
+            }
             if reindex
-            else {"required": False, "job": None, "artifact": None}
+            else {**full_reindex_payload(document), "job": None, "artifact": None}
         ),
+    }
+
+
+def selected_documents_preflight(instance_id: str, document_ids: list[str]) -> tuple[RagInstance, list[Document], list[dict], list[dict]]:
+    """One validation source for REST, SSE, and read-only search eligibility."""
+    instance = get_instance(instance_id)
+    documents = []
+    statuses = []
+    conflicts = []
+    for document_id in document_ids:
+        document = instance.documents.get(document_id)
+        if not document:
+            conflict = {
+                "document_id": document_id,
+                "eligible": False,
+                "code": "DOCUMENT_NOT_FOUND",
+                "action": "REMOVE_DOCUMENT",
+                "message": "이 RAG 인스턴스에서 문서를 찾을 수 없습니다.",
+            }
+            statuses.append(conflict)
+            conflicts.append({**conflict, "http_status": 404})
+            continue
+        if not document.finalized_candidate_id:
+            conflict = {
+                "document_id": document.id,
+                "filename": document.filename,
+                "eligible": False,
+                "code": "DOCUMENT_NOT_FINALIZED",
+                "action": "TUNE_DOCUMENT",
+                "message": "튜닝을 마친 문서만 실사용 검색에 포함할 수 있습니다.",
+                "full_reindex": full_reindex_payload(document),
+            }
+            statuses.append(conflict)
+            conflicts.append({**conflict, "http_status": 409})
+            continue
+        reindex = full_reindex_payload(document)
+        if not reindex["search_eligible"]:
+            state = document.full_reindex_state
+            failed = state in {JobState.FAILED, JobState.CANCELLED}
+            conflict = {
+                "document_id": document.id,
+                "filename": document.filename,
+                "eligible": False,
+                "code": "FULL_REINDEX_FAILED" if failed else "FULL_REINDEX_PENDING",
+                "action": "RETRY_FULL_REINDEX" if failed else "WAIT_FOR_FULL_REINDEX",
+                "message": (
+                    "전체 문서 재인덱싱이 완료되지 않았습니다. 재시도 후 검색할 수 있습니다."
+                    if failed
+                    else "샘플 비교에서 고른 설정으로 전체 문서를 재인덱싱 중입니다. 완료 후 검색할 수 있습니다."
+                ),
+                "full_reindex": reindex,
+            }
+            statuses.append(conflict)
+            conflicts.append({**conflict, "http_status": 409})
+            continue
+        documents.append(document)
+        statuses.append({
+            "document_id": document.id,
+            "filename": document.filename,
+            "eligible": True,
+            "code": None,
+            "action": None,
+            "full_reindex": reindex,
+        })
+    return instance, documents, statuses, conflicts
+
+
+def search_documents(instance_id: str, document_ids: list[str]) -> tuple[RagInstance, list[Document]]:
+    """Keep established REST/SSE validation errors while sharing preflight facts."""
+    instance, documents, _, conflicts = selected_documents_preflight(instance_id, document_ids)
+    if not conflicts:
+        return instance, documents
+    conflict = conflicts[0]
+    if conflict["code"] == "DOCUMENT_NOT_FOUND":
+        raise not_found("문서")
+    if conflict["code"] == "DOCUMENT_NOT_FINALIZED":
+        raise HTTPException(409, detail={"code": conflict["code"], "message": conflict["message"]})
+    raise HTTPException(
+        409,
+        detail={"code": conflict["code"], "message": conflict["message"], "details": conflict["full_reindex"]},
+    )
+
+
+@app.get(f"{API_PREFIX}/rag-instances/{{instance_id}}/search/preflight")
+def search_preflight(instance_id: str, document_ids: list[str] = Query(...)) -> dict:
+    """Read-only eligibility report; it does not retrieve, generate, or persist."""
+    instance, documents, statuses, conflicts = selected_documents_preflight(instance_id, document_ids)
+    return {
+        "instance_id": instance.id,
+        "eligible": not conflicts,
+        "document_count": len(document_ids),
+        "eligible_document_ids": [document.id for document in documents],
+        "documents": statuses,
+        "conflicts": conflicts,
+        "next_actions": sorted({conflict["action"] for conflict in conflicts}),
     }
 
 
 @app.post(f"{API_PREFIX}/rag-instances/{{instance_id}}/search")
 def search(instance_id: str, body: SearchRequest) -> dict:
-    instance = get_instance(instance_id)
-    documents = []
-    for document_id in body.document_ids:
-        document = instance.documents.get(document_id)
-        if not document:
-            raise not_found("문서")
-        if not document.finalized_candidate_id:
-            raise HTTPException(409, detail={"code": "DOCUMENT_NOT_FINALIZED", "message": "튜닝을 마친 문서만 실사용 검색에 포함할 수 있습니다."})
-        if document.full_reindex_state and document.full_reindex_state != JobState.SUCCEEDED:
-            raise HTTPException(
-                409,
-                detail={
-                    "code": "FULL_REINDEX_PENDING",
-                    "message": "샘플 비교에서 고른 설정으로 전체 문서를 재인덱싱 중입니다. 완료 후 검색할 수 있습니다.",
-                    "details": {"job_id": document.full_reindex_job_id, "state": document.full_reindex_state},
-                },
-            )
-        documents.append(document)
+    instance, documents = search_documents(instance_id, body.document_ids)
     if len(documents) == 1:
         # Keep the established single-document retrieval and answer contract intact.
         document = documents[0]
@@ -2618,14 +3832,38 @@ def search(instance_id: str, body: SearchRequest) -> dict:
 
 
 @app.get(f"{API_PREFIX}/rag-instances/{{instance_id}}/search/stream")
-async def search_stream(instance_id: str, question: str, document_ids: list[str] = Query(...), sensitivity: Sensitivity = Sensitivity.BALANCED) -> StreamingResponse:
-    result = search(instance_id, SearchRequest(question=question, document_ids=document_ids, sensitivity=sensitivity))
+async def search_stream(
+    instance_id: str,
+    request: Request,
+    question: str,
+    document_ids: list[str] = Query(...),
+    sensitivity: Sensitivity = Sensitivity.BALANCED,
+) -> StreamingResponse:
+    # Preflight before opening an SSE 200 response, so full-reindex errors keep
+    # the identical structured HTTP 409 contract as POST /search.
+    search_documents(instance_id, document_ids)
 
     async def events() -> AsyncIterator[str]:
+        yield f"event: status\ndata: {json.dumps({'phase': 'RETRIEVING', 'cancellable': True, 'streaming': 'BUFFERED_REPLAY'})}\n\n"
+        if await request.is_disconnected():
+            return
+        # The generator HTTP contract is request/response, not token streaming.
+        # Run it off the event loop so the first status reaches the client before
+        # retrieval/generation finish; only safe, validated answer tokens replay.
+        result = await run_in_threadpool(
+            search,
+            instance_id,
+            SearchRequest(question=question, document_ids=document_ids, sensitivity=sensitivity),
+        )
+        if await request.is_disconnected():
+            return
+        yield f"event: status\ndata: {json.dumps({'phase': 'ANSWER_READY', 'cancellable': True, 'streaming': 'BUFFERED_REPLAY'})}\n\n"
         yield f"event: citations\ndata: {json.dumps(result['citations'], ensure_ascii=False)}\n\n"
         for index, token in enumerate(result["answer"].split(" ")):
-            yield f"event: token\ndata: {json.dumps({'token': token + ' ', 'index': index}, ensure_ascii=False)}\n\n"
-        yield f"event: done\ndata: {json.dumps({'grounded': result['grounded'], 'relevance': result['relevance'], 'grouped_citations': result.get('grouped_citations', []), 'retrieval_metadata': result.get('retrieval_metadata', {}), 'generation': result.get('generation', {}), 'artifact_id': result.get('artifact', {}).get('id')})}\n\n"
+            if await request.is_disconnected():
+                return
+            yield f"event: token\ndata: {json.dumps({'token': token + ' ', 'index': index, 'delivery': 'BUFFERED_REPLAY'}, ensure_ascii=False)}\n\n"
+        yield f"event: done\ndata: {json.dumps({'grounded': result['grounded'], 'relevance': result['relevance'], 'grouped_citations': result.get('grouped_citations', []), 'retrieval_metadata': result.get('retrieval_metadata', {}), 'generation': result.get('generation', {}), 'artifact_id': result.get('artifact', {}).get('id'), 'streaming': {'mode': 'BUFFERED_REPLAY', 'server_cancellation': 'disconnect_stops_future_events_but_does_not_interrupt_active_provider_request'}})}\n\n"
 
     return StreamingResponse(events(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
@@ -2724,7 +3962,40 @@ def feedback(instance_id: str, body: FeedbackRequest) -> dict:
 def feedback_summary(instance_id: str) -> dict:
     instance = get_instance(instance_id)
     items = [item for item in FEEDBACK if item["instance_id"] == instance_id]
-    return {"positive_count": sum(1 for item in items if item["rating"] > 0), "negative_count": sum(1 for item in items if item["rating"] < 0), "total": len(items), "retuning_signal": feedback_signal(instance)}
+    signal = feedback_signal(instance)
+    return {
+        "positive_count": sum(1 for item in items if item["rating"] > 0),
+        "negative_count": sum(1 for item in items if item["rating"] < 0),
+        "total": len(items),
+        "retuning_signal": signal,
+        "retuning_recommendation": signal,
+    }
+
+
+@app.get(f"{API_PREFIX}/rag-instances/{{instance_id}}/retuning-recommendation")
+def get_retuning_recommendation(instance_id: str) -> dict:
+    """Expose every recommendation input instead of hiding a numeric trigger."""
+    instance = get_instance(instance_id)
+    signal = feedback_signal(instance)
+    baseline_document_ids = [
+        document_id
+        for document_id in signal["eligible_document_ids"]
+        if instance.documents[document_id].finalized_candidate_id
+    ]
+    return {
+        **signal,
+        "baseline_snapshot": (
+            retuning_baseline_snapshot(instance, baseline_document_ids)
+            if baseline_document_ids
+            else {
+                "version": RETUNING_SIGNAL_VERSION,
+                "captured_at": now(),
+                "document_ids": [],
+                "selected_pipelines": [],
+                "recommendation": signal,
+            }
+        ),
+    }
 
 
 @app.post(f"{API_PREFIX}/rag-instances/{{instance_id}}/retune", status_code=status.HTTP_202_ACCEPTED)
@@ -2737,6 +4008,22 @@ def retune_documents(instance_id: str, body: RetuneRequest) -> dict:
             raise not_found("문서")
         if not document.finalized_candidate_id:
             raise HTTPException(409, detail={"code": "DOCUMENT_ALREADY_TUNING", "message": "이미 튜닝 중인 문서입니다."})
+        documents.append(document)
+    baseline = retuning_baseline_snapshot(instance, body.document_ids)
+    baseline_artifact = register_artifact(
+        instance,
+        type="RETUNING_BASELINE",
+        title="재튜닝 전 기준선",
+        context_document_ids=body.document_ids,
+        metadata={
+            "context_status": "AVAILABLE",
+            "signal_version": RETUNING_SIGNAL_VERSION,
+            "summary": "재튜닝 전 확정 파이프라인과 저장된 관측 신호를 고정했습니다.",
+            "recommendation": baseline["recommendation"],
+        },
+        payload=baseline,
+    )
+    for document in documents:
         for candidate_id in list(document.candidate_ids):
             CANDIDATES.pop(candidate_id, None)
             if candidate_id in instance.candidate_ids:
@@ -2748,14 +4035,19 @@ def retune_documents(instance_id: str, body: RetuneRequest) -> dict:
         document.full_reindex_state = None
         document.parse_status = "UPLOADED"
         document.segments = []
-        documents.append(document)
     instance.status = InstanceStatus.SETTING_UP
     artifact = register_artifact(
         instance,
         type="RETUNING_RUN",
         title="재튜닝 준비 작업",
         context_document_ids=body.document_ids,
-        metadata={"context_status": "AVAILABLE", "reason": body.reason, "summary": "새 비교 후보를 준비하고 있어요."},
+        metadata={
+            "context_status": "AVAILABLE",
+            "reason": body.reason,
+            "summary": "새 비교 후보를 준비하고 있어요.",
+            "baseline_artifact_id": baseline_artifact.id,
+            "signal_version": RETUNING_SIGNAL_VERSION,
+        },
         artifact_status=ArtifactStatus.PROCESSING,
     )
     job = ProcessingJob(
@@ -2776,7 +4068,14 @@ def retune_documents(instance_id: str, body: RetuneRequest) -> dict:
         document.processing_job_id = job.id
     persist_state()
     start_processing_job(job, PipelineMode.RETUNE)
-    return {"job": job_payload(job), "artifact": artifact_payload(artifact), "documents": [document_payload(document) for document in documents], "next_action": "TUNE_DOCUMENT"}
+    return {
+        "job": job_payload(job),
+        "artifact": artifact_payload(artifact),
+        "baseline_artifact": artifact_payload(baseline_artifact),
+        "recommendation": baseline["recommendation"],
+        "documents": [document_payload(document) for document in documents],
+        "next_action": "TUNE_DOCUMENT",
+    }
 
 
 @app.delete(f"{API_PREFIX}/rag-instances/{{instance_id}}/documents/{{document_id}}", status_code=status.HTTP_200_OK)

@@ -71,4 +71,22 @@ describe('RagCreatePage', () => {
     expect(screen.getByText(/Recall@1 75.0% · Recall@5 92.0%/)).toBeInTheDocument();
     expect(screen.getByText(/MRR 81.0% · 평균 42ms/)).toBeInTheDocument();
   });
+
+  it('keeps the questionnaire available and shows an actionable API error', async () => {
+    const user = userEvent.setup();
+    vi.spyOn(ragApi, 'recommendEmbeddingModels').mockRejectedValue(
+      new Error('추천 서비스를 사용할 수 없어요.'),
+    );
+    vi.spyOn(ragApi, 'latestEmbeddingBenchmark').mockResolvedValue(undefined);
+    render(
+      <MemoryRouter>
+        <RagCreatePage />
+      </MemoryRouter>,
+    );
+
+    await user.click(screen.getByRole('button', { name: '후보 비교하기 →' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('추천 서비스를 사용할 수 없어요.');
+    expect(screen.getByRole('button', { name: '후보 비교하기 →' })).toBeEnabled();
+    expect(screen.getByText('어떤 문서를 다루나요?')).toBeInTheDocument();
+  });
 });

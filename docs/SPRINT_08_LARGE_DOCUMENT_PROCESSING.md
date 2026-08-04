@@ -40,7 +40,7 @@ The policy is discoverable via `GET /api/v1/large-document-policy`.
 
 For text uploads, this is calculated before the job is queued. For binary uploads it is recalculated after parsing; the authoritative plan is available through `GET /api/v1/rag-jobs/{jobId}` as `comparison_plans` and from the document detail. The processing artifact stores the same plan.
 
-`GET /api/v1/rag-instances/{id}` exposes each document's `comparison` object plus `full_reindex` state. Candidate payloads retain their comparison scope, estimated chunk count, and selected chunk count; `chunk_count` is the currently indexed amount.
+`GET /api/v1/rag-instances/{id}` exposes each document's `comparison` object plus `full_reindex` state. Candidate payloads retain their comparison scope, estimated chunk count, and selected chunk count; `chunk_count` is the currently indexed amount. `full_reindex` also declares `search_eligible`, `search_policy: "BLOCK_UNTIL_FULL_INDEX_SUCCEEDED"`, and `next_action` (`WAIT_FOR_FULL_REINDEX` or `RETRY_FULL_REINDEX`) so clients do not infer readiness from a stale candidate index.
 
 ### Finalization and full reindex
 
@@ -56,7 +56,7 @@ For text uploads, this is calculated before the job is queued. For binary upload
 }
 ```
 
-The job replaces the selected candidate's bounded index with chunks and vectors built from the full retained source. It has two visible stages: `FULL_CHUNKING` and `FULL_INDEXING`. It is persisted, resumes after process restart through the normal pending-job mechanism, and supports the existing cancel/retry endpoints. `search` returns `409 FULL_REINDEX_PENDING` until it succeeds so a sampled index is never presented as the finished RAG.
+The job replaces the selected candidate's bounded index with chunks and vectors built from the full retained source. It has two visible stages: `FULL_CHUNKING` and `FULL_INDEXING`. It is persisted, resumes after process restart through the normal pending-job mechanism, and supports the existing cancel/retry endpoints. The chosen policy is strict: a sampled index is never searchable after finalization. Both `POST /search` and `GET /search/stream` return the same structured `409 FULL_REINDEX_PENDING` detail while work is active, or `409 FULL_REINDEX_FAILED` after failed/cancelled work, until the full index succeeds.
 
 ## Assumptions and boundaries
 

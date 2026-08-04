@@ -11,7 +11,10 @@
 | 적응형 청킹 | 문단, 제목, 표 형태, 길이, OCR 여부를 분석해 문서별 청킹 후보와 크기·오버랩·표 행 수 파라미터를 계산합니다. |
 | 파이프라인 비교 | 문서마다 3개 청킹 × 3개 검색 방식(Hybrid, Hybrid + Rerank, 문서 특성별 Dense 또는 BM25)의 답변과 인라인 근거를 비교합니다. |
 | 확정·검색 | 여러 후보에 투표할 수 있고 단독 1위만 확정합니다. 확정 뒤에는 근거가 있는 검색, 민감도 조절, 원문 인용 탐색을 제공합니다. |
-| 운영 흐름 | 인스턴스·문서·후보·job·비교 결과·투표·산출물은 SQLite snapshot에 저장되어 재방문 뒤에도 복원됩니다. 피드백 누적 시 재튜닝 신호를 제공합니다. |
+| 운영 흐름 | 인스턴스·문서·후보·job·비교 결과·투표·산출물은 SQLite snapshot에 저장되어 재방문 뒤에도 복원됩니다. 피드백 누적 시 설명 가능한 재튜닝 추천과 전후 artifact를 제공합니다. |
+| 원본·재현성 | 원본은 SHA-256 기준으로 인스턴스 안에서 dedup해 immutable storage adapter에 보관하고, parser·chunking·embedding provenance와 명시적 재파싱 이력을 남깁니다. |
+| 운영 작업 | 개발용 thread fallback을 유지하면서 Redis/SQS-compatible dispatch, 멱등성, heartbeat, retry/backoff, dead-letter/recovery 계약을 제공합니다. |
+| 적응형 탐색 | 후보 풀을 제한적으로 좁히고 파라미터 제안을 이력으로 보관합니다. 자동 선택·확정은 하지 않으며 사용자가 rollback/restore할 수 있습니다. |
 | 모델 계약 | 로컬 TEI 임베딩/reranker, OCR, Redis queue의 readiness와 인스턴스별 실행 계획을 API로 확인할 수 있습니다. |
 
 ## 사용자 흐름
@@ -73,13 +76,14 @@ npm run build
 - OpenAPI: [http://127.0.0.1:8010/api/v1/openapi.json](http://127.0.0.1:8010/api/v1/openapi.json)
 - **기능 명세서·인계 문서:** [docs/FEATURE_SPECIFICATION.md](docs/FEATURE_SPECIFICATION.md)
 - **개발 백로그·스프린트 순서:** [RAG_PORTAL_FEATURE_PLAN.md](RAG_PORTAL_FEATURE_PLAN.md)
+- **Sprint 07–15 QA:** [backend QA](docs/SPRINT_07_15_BACKEND_QA.md), [frontend QA](docs/design/SPRINT_07_15_FRONTEND_QA.md), [UX QA](docs/design/SPRINT_07_15_UX_QA.md)
 - Backend contract: [apps/backend/README.md](apps/backend/README.md)
 - Adaptive chunking policy: [docs/SPRINT_05_ADAPTIVE_CHUNKING.md](docs/SPRINT_05_ADAPTIVE_CHUNKING.md)
 - Product decisions: [docs/PRODUCT_MVP_DECISIONS.md](docs/PRODUCT_MVP_DECISIONS.md)
 
 ## 현재 경계와 다음 운영 작업
 
-- SQLite snapshot은 단일 프로세스 재시작을 위한 영속성이고, 다중 worker 운영용 데이터베이스는 아닙니다.
-- 원본 이진 파일은 현재 SQLite snapshot에 보관하며, 운영 환경에서는 object storage로 옮겨야 합니다.
-- Redis adapter는 구현되어 있으나 이 로컬 환경에는 Redis가 기동되어 있지 않습니다.
+- SQLite snapshot은 단일 프로세스 재시작을 위한 영속성입니다. worker dispatch/state의 계약은 durable하게 저장하지만, 운영용 다중 worker 데이터베이스는 별도 배포가 필요합니다.
+- 원본 이진 파일은 기본 local source storage에 보관하며, object storage gateway 환경변수를 설정하면 같은 adapter 계약으로 전환합니다. 실제 gateway smoke는 아직 수행되지 않았습니다.
+- Redis/SQS adapter는 구현되어 있으나 이 로컬 환경에는 broker/worker가 기동되어 있지 않습니다.
 - 실제 로컬 모델 서버와 Tesseract도 아직 이 환경에 구축되지 않았습니다. API는 이 상태를 `NOT_CONFIGURED`, `UNAVAILABLE`, `NOT_INSTALLED`로 표시합니다.

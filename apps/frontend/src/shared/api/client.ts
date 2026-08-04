@@ -1,8 +1,10 @@
 import type {
   ChatAnswer,
+  CandidateExploration,
   Citation,
   ComparisonRound,
   CreateRagInput,
+  DocumentProvenance,
   EmbeddingBenchmark,
   EmbeddingBenchmarkResult,
   EmbeddingModelRecommendation,
@@ -14,7 +16,11 @@ import type {
   RagInstance,
   RagInstanceDetail,
   RagProcessingJob,
+  RetuneStart,
   RetrievalConfig,
+  RetuningComparisonState,
+  RetuningQualityState,
+  RetuningSignal,
   SearchDocumentCoverage,
 } from './types';
 import { candidateFixtures, mockInstances, mockRound } from '../mocks/ragFixtures';
@@ -22,6 +28,28 @@ import { candidateFixtures, mockInstances, mockRound } from '../mocks/ragFixture
 const baseUrl = import.meta.env.VITE_API_BASE_URL?.replace(/\/$/, '');
 let localInstances = [...mockInstances];
 type Json = Record<string, unknown>;
+
+class ApiRequestError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly payload: Json,
+  ) {
+    super(message);
+    this.name = 'ApiRequestError';
+  }
+}
+
+export class SearchPreflightError extends Error {
+  constructor(
+    message: string,
+    readonly documentIds: string[],
+    readonly code?: string,
+  ) {
+    super(message);
+    this.name = 'SearchPreflightError';
+  }
+}
 
 function base64FromBytes(bytes: Uint8Array): string {
   let binary = '';
@@ -40,7 +68,13 @@ export type AnswerStreamOptions = {
 function abortable<T>(operation: Promise<T>, signal?: AbortSignal): Promise<T> {
   if (!signal) return operation;
   return new Promise((resolve, reject) => {
-    const abort = () => reject(new DOMException('답변 생성을 중단했어요.', 'AbortError'));
+    const abort = () =>
+      reject(
+        new DOMException(
+          '이 화면의 답변 표시를 중단했어요. 서버 작업은 계속될 수 있어요.',
+          'AbortError',
+        ),
+      );
     if (signal.aborted) {
       abort();
       return;
@@ -66,15 +100,68 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     ...init,
   });
   if (!response.ok) {
-    const payload = await response.json().catch(() => ({}));
-    throw new Error(
-      (payload as { detail?: { message?: string } }).detail?.message ??
+    const payload = (await response.json().catch(() => ({}))) as Json;
+    const detail = payload.detail as Json | undefined;
+    throw new ApiRequestError(
+      (typeof detail?.message === 'string' ? detail.message : undefined) ??
         `요청에 실패했습니다 (${response.status}).`,
+      response.status,
+      payload,
     );
   }
   return response.json() as Promise<T>;
 }
 const wait = (ms = 250) => new Promise((resolve) => window.setTimeout(resolve, ms));
+
+function fallbackOnlyWithoutApi(error: unknown): void {
+  if (baseUrl) throw error;
+}
+
+function preflightConflictFromPayload(
+  payload: Json,
+  fallbackDocumentIds: string[],
+  fallbackMessage?: string,
+): SearchPreflightError {
+  const detail = payload.detail as Json | undefined;
+  const response = detail ?? payload;
+  const conflicts = Array.isArray(response.conflicts)
+    ? response.conflicts.filter((item): item is Json => Boolean(item) && typeof item === 'object')
+    : [response];
+  const documentIds = Array.from(
+    new Set(
+      conflicts.flatMap((conflict) => {
+        const id = conflict.document_id ?? conflict.id;
+        return typeof id === 'string' ? [id] : [];
+      }),
+    ),
+  );
+  const first = conflicts[0] ?? {};
+  const code = typeof first.code === 'string' ? first.code : undefined;
+  const message =
+    typeof first.message === 'string'
+      ? first.message
+      : code === 'FULL_REINDEX_PENDING'
+        ? '전체 문서 색인이 끝날 때까지 기다린 뒤 다시 검색해 주세요.'
+        : code === 'FULL_REINDEX_FAILED'
+          ? '전체 문서 색인을 다시 시도한 뒤 검색해 주세요.'
+          : code === 'DOCUMENT_NOT_FINALIZED'
+            ? '문서 비교와 확정을 마친 뒤 검색해 주세요.'
+            : (fallbackMessage ?? '검색을 시작하기 전에 문서 준비 상태를 확인하지 못했어요.');
+  return new SearchPreflightError(
+    message,
+    documentIds.length ? documentIds : fallbackDocumentIds,
+    code,
+  );
+}
+
+function preflightConflict(error: unknown, fallbackDocumentIds: string[]): SearchPreflightError {
+  if (error instanceof ApiRequestError)
+    return preflightConflictFromPayload(error.payload, fallbackDocumentIds, error.message);
+  return new SearchPreflightError(
+    (error as Error).message || '검색을 시작하기 전에 문서 준비 상태를 확인하지 못했어요.',
+    fallbackDocumentIds,
+  );
+}
 const configMap: Record<string, RetrievalConfig> = {
   hybrid: 'HYBRID',
   hybrid_rerank: 'HYBRID_RERANK',
@@ -108,7 +195,7 @@ function citationFromWire(citation: Json): Citation {
         ? citation.filename
         : undefined;
   return {
-    id: String(citation.segment_id),
+    id: String(citation.segment_id ?? citation.id ?? ''),
     title: String(citation.filename ?? documentName ?? '문서 근거'),
     excerpt: String(citation.excerpt),
     page: locationLabel(citation.location, citation.ordinal),
@@ -118,26 +205,69 @@ function citationFromWire(citation: Json): Citation {
   };
 }
 
+function groupedCitationDocuments(data: Json) {
+  return ((data.grouped_citations as Json[] | undefined) ?? []).map((group) => ({
+    documentId: typeof group.document_id === 'string' ? group.document_id : undefined,
+    documentName: String(group.document_name ?? group.filename ?? '문서 근거'),
+    citationIds: new Set(
+      ((group.citations as Json[] | undefined) ?? []).map((citation) =>
+        String(citation.segment_id ?? citation.id ?? ''),
+      ),
+    ),
+  }));
+}
+
+function enrichCitationDocuments(citations: Citation[], data: Json): Citation[] {
+  const groups = groupedCitationDocuments(data);
+  return citations.map((mapped) => {
+    const group = groups.find((item) => item.citationIds.has(mapped.id));
+    return {
+      ...mapped,
+      documentId: mapped.documentId ?? group?.documentId,
+      documentName: mapped.documentName ?? group?.documentName,
+      title: mapped.title === '문서 근거' ? (group?.documentName ?? mapped.title) : mapped.title,
+    };
+  });
+}
+
+function citationsFromWire(data: Json): Citation[] {
+  return enrichCitationDocuments(
+    ((data.citations as Json[] | undefined) ?? []).map(citationFromWire),
+    data,
+  );
+}
+
 function coverageFromWire(data: Json): SearchDocumentCoverage[] | undefined {
   const coverage = data.document_coverage as Json[] | undefined;
-  if (!coverage?.length) return undefined;
-  return coverage.map((item) => ({
-    documentId: typeof item.document_id === 'string' ? item.document_id : undefined,
-    documentName: String(item.document_name ?? item.filename ?? '문서 근거'),
-    citationCount: Number(item.citation_count ?? item.citations ?? 0),
-  }));
+  if (coverage?.length)
+    return coverage.map((item) => ({
+      documentId: typeof item.document_id === 'string' ? item.document_id : undefined,
+      documentName: String(item.document_name ?? item.filename ?? '문서 근거'),
+      citationCount: Number(item.citation_count ?? item.citations ?? 0),
+    }));
+  const groups = groupedCitationDocuments(data);
+  return groups.length
+    ? groups.map((group) => ({
+        documentId: group.documentId,
+        documentName: group.documentName,
+        citationCount: group.citationIds.size,
+      }))
+    : undefined;
 }
 
 function jobFromWire(job: Json | undefined): RagProcessingJob | undefined {
   if (!job) return undefined;
   const progress = (job.progress as Json | undefined) ?? {};
+  const recovery = (job.recovery as Json | undefined) ?? {};
+  const deadLetter = (job.dead_letter as Json | undefined) ?? {};
+  const lifecycle = (job.lifecycle as Json | undefined) ?? {};
   return {
     id: String(job.id),
     state: String(job.state) as RagProcessingJob['state'],
     currentStep: String(job.current_step ?? '작업 상태를 확인하고 있어요.'),
     completed: Number(progress.completed ?? 0),
     total: Number(progress.total ?? 0),
-    canRetry: Boolean(job.can_retry),
+    canRetry: Boolean(job.can_retry ?? job.can_recover ?? recovery.can_retry),
     canCancel: Boolean(job.can_cancel),
     errorMessage: typeof job.error_message === 'string' ? job.error_message : undefined,
     stages: ((job.stages as Json[] | undefined) ?? []).map((stage) => ({
@@ -145,6 +275,22 @@ function jobFromWire(job: Json | undefined): RagProcessingJob | undefined {
       label: String(stage.label),
       state: String(stage.state) as 'QUEUED' | 'SUCCEEDED' | 'FAILED',
     })),
+    kind: typeof job.kind === 'string' ? job.kind : undefined,
+    attempt: typeof job.attempt === 'number' ? job.attempt : undefined,
+    createdAt: typeof job.created_at === 'string' ? job.created_at : undefined,
+    completedAt: typeof job.completed_at === 'string' ? job.completed_at : undefined,
+    operationalState:
+      typeof recovery.state === 'string'
+        ? recovery.state
+        : typeof deadLetter.state === 'string'
+          ? deadLetter.state
+          : deadLetter.active === true
+            ? 'DEAD_LETTER'
+            : typeof lifecycle.state === 'string'
+              ? lifecycle.state
+              : typeof job.operational_state === 'string'
+                ? job.operational_state
+                : undefined,
   };
 }
 
@@ -218,9 +364,429 @@ function generationFromWire(metadata: Json | undefined): GroundedGenerationMetad
         ? generation.mode.toLowerCase().includes('fallback') ||
           generation.mode.toLowerCase().includes('extractive')
         : false;
-  return status || provider || detail || fallback
-    ? { status, fallback, provider, detail }
+  const fallbackReason =
+    typeof generation?.fallback_reason === 'string' ? generation.fallback_reason : undefined;
+  const groundingValid =
+    typeof generation?.grounding_valid === 'boolean' ? generation.grounding_valid : undefined;
+  return status || provider || detail || fallback || fallbackReason || groundingValid !== undefined
+    ? { status, fallback, provider, detail, fallbackReason, groundingValid }
     : undefined;
+}
+
+function stringList(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === 'string' && Boolean(item.trim()))
+    : [];
+}
+
+function retuningReasonCopy(reason: string): string {
+  const labels: Record<string, string> = {
+    RECENT_NEGATIVE_FEEDBACK_THRESHOLD: '최근 부정 피드백의 가중치가 권장 기준에 도달했어요.',
+    ANSWER_INTEGRITY_EVENTS_THRESHOLD:
+      '저장된 답변 근거·fallback 점검 신호가 권장 기준에 도달했어요.',
+    FEEDBACK_AND_ANSWER_INTEGRITY: '부정 피드백과 답변 점검 신호가 함께 관찰됐어요.',
+    BENCHMARK_NOT_QUALITY_EVIDENCE:
+      'fallback·미완료 벤치마크는 품질 점수 근거로 사용하지 않았어요.',
+  };
+  return labels[reason] ?? reason;
+}
+
+function retuningQualityFromWire(value: Json | undefined): RetuningQualityState {
+  if (!value) return 'MISSING';
+  const status = String(value.status ?? value.quality_status ?? '').toLowerCase();
+  if (value.fallback === true || status.includes('fallback')) return 'FALLBACK';
+  if (status.includes('pending') || status.includes('running') || status.includes('queued'))
+    return 'PENDING';
+  if (
+    status.includes('measured') ||
+    status.includes('observed') ||
+    status.includes('verified') ||
+    value.measured === true
+  )
+    return 'MEASURED';
+  return 'MISSING';
+}
+
+function retuningSignalFromWire(item: Json): RetuningSignal | undefined {
+  const retuning = item.retuning as Json | undefined;
+  const preview = item.retune_preview as Json | undefined;
+  const signal =
+    (item.retuning_signal as Json | undefined) ??
+    (retuning?.signal as Json | undefined) ??
+    (preview?.signal as Json | undefined);
+  if (!signal && !retuning && !preview) return undefined;
+  const inputs =
+    (signal?.inputs as Json | undefined) ??
+    (retuning?.recommendation_inputs as Json | undefined) ??
+    (preview?.recommendation_inputs as Json | undefined) ??
+    {};
+  const feedbackInput = (inputs.feedback as Json | undefined) ?? {};
+  const benchmarkInput = (inputs.benchmark_provider as Json | undefined) ?? {};
+  const comparison =
+    (retuning?.before_after as Json | undefined) ??
+    (preview?.before_after as Json | undefined) ??
+    (retuning?.comparison as Json | undefined) ??
+    (preview?.comparison as Json | undefined) ??
+    {};
+  const before =
+    (comparison.before as Json | undefined) ??
+    (comparison.baseline as Json | undefined) ??
+    (retuning?.baseline_snapshot as Json | undefined) ??
+    (preview?.baseline_snapshot as Json | undefined);
+  const after =
+    (comparison.after as Json | undefined) ??
+    (comparison.outcome as Json | undefined) ??
+    (retuning?.after_outcome as Json | undefined) ??
+    (preview?.after_outcome as Json | undefined);
+  const reasons = [
+    ...stringList(signal?.reasons),
+    ...stringList(signal?.recommendation_reasons),
+    ...stringList(inputs.reasons),
+    ...stringList(retuning?.reasons),
+  ].map(retuningReasonCopy);
+  const message =
+    typeof signal?.message === 'string'
+      ? signal.message
+      : typeof retuning?.message === 'string'
+        ? retuning.message
+        : undefined;
+  if (!reasons.length && message) reasons.push(message);
+  const comparisonState: RetuningComparisonState = {
+    beforeLabel:
+      typeof before?.label === 'string'
+        ? before.label
+        : typeof before?.name === 'string'
+          ? before.name
+          : '현재 설정',
+    beforeQuality: before
+      ? retuningQualityFromWire(before)
+      : benchmarkInput.status === 'REAL_PROVIDER_EVIDENCE'
+        ? 'MEASURED'
+        : benchmarkInput.status === 'NOT_RUN'
+          ? 'MISSING'
+          : 'FALLBACK',
+    afterLabel:
+      typeof after?.label === 'string'
+        ? after.label
+        : typeof after?.name === 'string'
+          ? after.name
+          : '재튜닝 후 비교 결과',
+    afterQuality: after ? retuningQualityFromWire(after) : 'PENDING',
+    outcomeArtifactId:
+      typeof after?.artifact_id === 'string'
+        ? after.artifact_id
+        : typeof comparison.outcome_artifact_id === 'string'
+          ? comparison.outcome_artifact_id
+          : undefined,
+  };
+  return {
+    recommended: Boolean(signal?.recommended ?? retuning?.recommended ?? preview?.recommended),
+    negativeCount: Number(signal?.negative_count ?? inputs.negative_count ?? 0),
+    positiveCount:
+      typeof (signal?.positive_count ?? feedbackInput.positive_count ?? inputs.positive_count) ===
+      'number'
+        ? Number(signal?.positive_count ?? feedbackInput.positive_count ?? inputs.positive_count)
+        : undefined,
+    feedbackTotal:
+      typeof (signal?.total ?? signal?.feedback_total ?? feedbackInput.total ?? inputs.total) ===
+      'number'
+        ? Number(signal?.total ?? signal?.feedback_total ?? feedbackInput.total ?? inputs.total)
+        : undefined,
+    threshold: Number(signal?.threshold ?? inputs.threshold ?? 0),
+    thresholdKind: signal?.threshold_details ? 'WEIGHTED_NEGATIVE_FEEDBACK' : 'COUNT',
+    eligibleDocumentIds: stringList(signal?.eligible_document_ids ?? inputs.eligible_document_ids),
+    reasons,
+    action:
+      signal?.action === 'START_RETUNE' || retuning?.action === 'START_RETUNE'
+        ? 'START_RETUNE'
+        : undefined,
+    policyVersion:
+      typeof signal?.version === 'string'
+        ? signal.version
+        : typeof inputs.policy_version === 'string'
+          ? inputs.policy_version
+          : typeof retuning?.policy_version === 'string'
+            ? retuning.policy_version
+            : undefined,
+    comparison: comparisonState,
+  };
+}
+
+function explorationEvidenceFromWire(raw: Json): CandidateExploration['evidenceBoundary'] {
+  const evidence = (raw.evidence as Json | undefined) ?? {};
+  const benchmark =
+    (evidence.benchmark as Json | undefined) ?? (raw.benchmark as Json | undefined) ?? {};
+  const status = String(
+    benchmark.status ?? evidence.status ?? raw.evidence_status ?? raw.benchmark_status ?? '',
+  ).toLowerCase();
+  if (benchmark.fallback === true || evidence.fallback === true || status.includes('fallback'))
+    return 'FALLBACK';
+  if (status.includes('pending') || status.includes('running')) return 'PENDING';
+  if (status.includes('measured') || status.includes('observed') || status.includes('verified'))
+    return 'MEASURED';
+  return 'MISSING';
+}
+
+function explorationRationales(value: unknown): string[] {
+  if (Array.isArray(value))
+    return value.flatMap((item) => {
+      if (typeof item === 'string' && item.trim()) return [item];
+      if (item && typeof item === 'object') {
+        const raw = item as Json;
+        const parameter = typeof raw.parameter === 'string' ? raw.parameter : undefined;
+        const reason =
+          typeof raw.reason === 'string'
+            ? raw.reason
+            : typeof raw.rationale === 'string'
+              ? raw.rationale
+              : typeof raw.label === 'string'
+                ? raw.label
+                : undefined;
+        return reason ? [parameter ? `${parameter}: ${reason}` : reason] : [];
+      }
+      return [];
+    });
+  return [];
+}
+
+function candidateExplorationFromWire(item: Json): CandidateExploration | undefined {
+  const raw =
+    (item.candidate_exploration as Json | undefined) ?? (item.exploration as Json | undefined);
+  if (!raw) return undefined;
+  const pool = (raw.pool as Json | undefined) ?? (raw.candidate_pool as Json | undefined) ?? {};
+  const proposedRaw = raw.proposed ?? raw.narrowed_candidates ?? raw.proposal;
+  const proposed = !Array.isArray(proposedRaw) ? ((proposedRaw as Json | undefined) ?? {}) : {};
+  const proposalItems = Array.isArray(proposedRaw)
+    ? proposedRaw.filter(
+        (proposal): proposal is Json => Boolean(proposal) && typeof proposal === 'object',
+      )
+    : [];
+  const rollback = (raw.rollback as Json | undefined) ?? (raw.restore as Json | undefined) ?? {};
+  const proposedCandidateIds = stringList(
+    proposed.candidate_ids ??
+      proposed.ids ??
+      raw.proposed_candidate_ids ??
+      raw.narrowed_candidate_ids,
+  );
+  const proposalCandidateIds = proposalItems
+    .map((proposal) => {
+      const candidate = proposal.candidate as Json | undefined;
+      return typeof proposal.candidate_id === 'string'
+        ? proposal.candidate_id
+        : typeof candidate?.id === 'string'
+          ? candidate.id
+          : undefined;
+    })
+    .filter((candidateId): candidateId is string => Boolean(candidateId));
+  const proposedCandidates = proposalItems
+    .map((proposal) => {
+      const candidate = proposal.candidate as Json | undefined;
+      const id =
+        typeof proposal.candidate_id === 'string'
+          ? proposal.candidate_id
+          : typeof candidate?.id === 'string'
+            ? candidate.id
+            : undefined;
+      const label =
+        typeof candidate?.friendly_name === 'string'
+          ? candidate.friendly_name
+          : typeof proposal.base_friendly_name === 'string'
+            ? proposal.base_friendly_name
+            : undefined;
+      return id && label ? { id, label } : undefined;
+    })
+    .filter((candidate): candidate is { id: string; label: string } => Boolean(candidate));
+  const rationales = Array.from(
+    new Set([
+      ...explorationRationales(raw.rationales),
+      ...explorationRationales(raw.rationale),
+      ...explorationRationales(raw.reasons),
+      ...explorationRationales(raw.parameter_changes),
+      ...explorationRationales(proposed.rationales),
+      ...proposalItems.flatMap((proposal) => {
+        const rationale = proposal.rationale as Json | undefined;
+        const retrieval = rationale?.retrieval_change as Json | undefined;
+        return explorationRationales([
+          rationale?.parameter_change_reason,
+          retrieval
+            ? `검색 방식: ${String(retrieval.from ?? '')} → ${String(retrieval.to ?? '')}`
+            : undefined,
+        ]);
+      }),
+    ]),
+  ).slice(0, 5);
+  return {
+    id: String(raw.id ?? ''),
+    phase: String(raw.phase ?? raw.state ?? 'EXPLORING'),
+    poolCount: Array.isArray(raw.pool)
+      ? raw.pool.length
+      : typeof pool.count === 'number'
+        ? pool.count
+        : typeof raw.pool_count === 'number'
+          ? raw.pool_count
+          : typeof raw.candidate_pool_count === 'number'
+            ? raw.candidate_pool_count
+            : undefined,
+    proposedCandidateIds: proposalCandidateIds.length ? proposalCandidateIds : proposedCandidateIds,
+    proposedCandidates,
+    rationales,
+    evidenceBoundary: explorationEvidenceFromWire(raw),
+    rollback:
+      rollback.supported === true || rollback.available === true || rollback.enabled === true
+        ? {
+            canRollback: rollback.status !== 'ROLLED_BACK' && rollback.rollback_supported !== false,
+            canRestore: rollback.restore_supported === true,
+            state: typeof rollback.state === 'string' ? rollback.state : undefined,
+          }
+        : undefined,
+  };
+}
+
+function provenanceFromWire(document: Json, candidate: Json | undefined, embeddingModel: unknown) {
+  const provenance =
+    (document.provenance as Json | undefined) ??
+    (document.source_provenance as Json | undefined) ??
+    {};
+  const source =
+    (provenance.source as Json | undefined) ?? (document.source as Json | undefined) ?? {};
+  const processing =
+    (provenance.processing as Json | undefined) ?? (document.processing as Json | undefined) ?? {};
+  const parserMetadata = (provenance.parser as Json | undefined) ?? {};
+  const chunkingMetadata = (provenance.chunking as Json | undefined) ?? {};
+  const modelMetadata = (provenance.model as Json | undefined) ?? {};
+  const dedup =
+    (provenance.deduplication as Json | undefined) ??
+    (provenance.dedup as Json | undefined) ??
+    (source.deduplication as Json | undefined) ??
+    (document.deduplication as Json | undefined) ??
+    (document.dedup as Json | undefined) ??
+    {};
+  const reparse =
+    (provenance.reparse as Json | undefined) ?? (document.reparse as Json | undefined) ?? {};
+  const checksum =
+    typeof provenance.checksum === 'string'
+      ? provenance.checksum
+      : typeof source.checksum === 'string'
+        ? source.checksum
+        : typeof source.checksum_sha256 === 'string'
+          ? source.checksum_sha256
+          : typeof document.checksum === 'string'
+            ? document.checksum
+            : undefined;
+  const rawDedup = String(dedup.outcome ?? dedup.status ?? document.dedup_outcome ?? '');
+  const deduplication: DocumentProvenance['deduplication'] = rawDedup
+    ? rawDedup.includes('REUSED') || rawDedup.includes('DUPLICATE')
+      ? rawDedup.includes('REPLACED')
+        ? 'DUPLICATE_REPLACED'
+        : 'DUPLICATE_REUSED'
+      : rawDedup.includes('NEW') || rawDedup.includes('STORED') || rawDedup.includes('CREATED')
+        ? 'NEW_SOURCE'
+        : 'UNKNOWN'
+    : undefined;
+  const originalAvailable =
+    typeof provenance.original_available === 'boolean'
+      ? provenance.original_available
+      : typeof source.original_available === 'boolean'
+        ? source.original_available
+        : typeof source.storage_key === 'string'
+          ? true
+          : typeof document.original_available === 'boolean'
+            ? document.original_available
+            : undefined;
+  const reparseAvailable =
+    typeof reparse.available === 'boolean'
+      ? reparse.available
+      : typeof reparse.allowed === 'boolean'
+        ? reparse.allowed
+        : originalAvailable === true
+          ? true
+          : undefined;
+  const parser =
+    typeof processing.parser === 'string'
+      ? processing.parser
+      : typeof parserMetadata.parser === 'string'
+        ? parserMetadata.parser
+        : typeof provenance.parser === 'string'
+          ? provenance.parser
+          : typeof document.parser === 'string'
+            ? document.parser
+            : undefined;
+  const parserVersion =
+    typeof processing.parser_version === 'string'
+      ? processing.parser_version
+      : typeof parserMetadata.version === 'string'
+        ? parserMetadata.version
+        : typeof provenance.parser_version === 'string'
+          ? provenance.parser_version
+          : typeof document.parser_version === 'string'
+            ? document.parser_version
+            : undefined;
+  const chunking =
+    typeof processing.chunking === 'string'
+      ? processing.chunking
+      : typeof processing.chunking_strategy === 'string'
+        ? processing.chunking_strategy
+        : typeof chunkingMetadata.strategy === 'string'
+          ? chunkingMetadata.strategy
+          : typeof candidate?.chunking_strategy === 'string'
+            ? candidate.chunking_strategy
+            : undefined;
+  const modelVersion =
+    typeof processing.model_version === 'string'
+      ? processing.model_version
+      : typeof modelMetadata.version === 'string'
+        ? modelMetadata.version
+        : typeof provenance.model_version === 'string'
+          ? provenance.model_version
+          : typeof document.model_version === 'string'
+            ? document.model_version
+            : undefined;
+  const embedding =
+    typeof processing.embedding_model === 'string'
+      ? processing.embedding_model
+      : typeof modelMetadata.embedding_model === 'string'
+        ? modelMetadata.embedding_model
+        : typeof provenance.embedding_model === 'string'
+          ? provenance.embedding_model
+          : typeof embeddingModel === 'string'
+            ? embeddingModel
+            : undefined;
+  const state =
+    typeof reparse.state === 'string'
+      ? reparse.state
+      : typeof document.reparse_state === 'string'
+        ? document.reparse_state
+        : undefined;
+  const known =
+    checksum ||
+    deduplication ||
+    parser ||
+    parserVersion ||
+    chunking ||
+    embedding ||
+    modelVersion ||
+    originalAvailable !== undefined ||
+    reparseAvailable !== undefined ||
+    state;
+  if (!known) return undefined;
+  return {
+    checksum,
+    deduplication,
+    parser,
+    parserVersion,
+    chunking,
+    embeddingModel: embedding,
+    modelVersion,
+    originalAvailable,
+    reparse:
+      reparseAvailable !== undefined || state
+        ? {
+            available: Boolean(reparseAvailable),
+            state: state as 'IDLE' | 'QUEUED' | 'PARSING' | 'SUCCEEDED' | 'FAILED' | undefined,
+            impact: typeof reparse.impact === 'string' ? reparse.impact : undefined,
+          }
+        : undefined,
+  };
 }
 
 function pipelineFromWire(candidate: Json, result?: Json): PipelineCandidate {
@@ -275,6 +841,8 @@ function instanceFromWire(item: Json, detail = false): RagInstanceDetail {
     const finalized = candidates.find(
       (candidate) => candidate.id === document.finalized_candidate_id,
     );
+    const comparison = (document.comparison as Json | undefined) ?? {};
+    const fullReindex = (document.full_reindex as Json | undefined) ?? {};
     return {
       id: String(document.id),
       name: String(document.filename),
@@ -285,15 +853,30 @@ function instanceFromWire(item: Json, detail = false): RagInstanceDetail {
       comparisonScope:
         document.comparison_scope === 'SAMPLE' || document.comparison_scope === 'FULL'
           ? document.comparison_scope
-          : undefined,
+          : comparison.scope === 'SAMPLE' || comparison.scope === 'FULL'
+            ? comparison.scope
+            : undefined,
       estimatedChunkCount:
         typeof document.estimated_chunk_count === 'number'
           ? document.estimated_chunk_count
-          : undefined,
+          : typeof comparison.estimated_chunk_count === 'number'
+            ? comparison.estimated_chunk_count
+            : undefined,
       comparisonChunkCount:
         typeof document.comparison_chunk_count === 'number'
           ? document.comparison_chunk_count
+          : typeof document.selected_chunk_count === 'number'
+            ? document.selected_chunk_count
+            : typeof comparison.selected_chunk_count === 'number'
+              ? comparison.selected_chunk_count
+              : undefined,
+      fullReindexRequired: fullReindex.required === true,
+      fullReindexReady: fullReindex.ready === true,
+      fullReindexState:
+        typeof fullReindex.state === 'string'
+          ? (fullReindex.state as RagProcessingJob['state'])
           : undefined,
+      provenance: provenanceFromWire(document, finalized, item.embedding_model),
     };
   });
   const candidates = rawDocs.flatMap((document) =>
@@ -302,9 +885,33 @@ function instanceFromWire(item: Json, detail = false): RagInstanceDetail {
     ),
   );
   const latestJob = jobFromWire(item.latest_job as Json | undefined);
-  const fullReindexJob = jobFromWire(
-    (item.pending_full_reindex_job ?? item.full_reindex_job) as Json | undefined,
-  );
+  const needsReindex = (document: Json) => {
+    const reindex = document.full_reindex as Json | undefined;
+    return reindex?.required === true && typeof reindex.job_id === 'string';
+  };
+  const reindexDocument =
+    rawDocs.find((document) => {
+      const reindex = document.full_reindex as Json | undefined;
+      return needsReindex(document) && reindex?.ready !== true;
+    }) ?? rawDocs.find(needsReindex);
+  const reindex = reindexDocument?.full_reindex as Json | undefined;
+  const reindexId = typeof reindex?.job_id === 'string' ? reindex.job_id : undefined;
+  const fullReindexJob =
+    jobFromWire((item.pending_full_reindex_job ?? item.full_reindex_job) as Json | undefined) ??
+    (reindexId && latestJob?.id === reindexId
+      ? latestJob
+      : reindexId
+        ? {
+            id: reindexId,
+            state: String(reindex?.state ?? 'QUEUED') as RagProcessingJob['state'],
+            currentStep: '전체 문서 색인을 준비하고 있어요.',
+            completed: 0,
+            total: 0,
+            canRetry: false,
+            canCancel: false,
+            stages: [],
+          }
+        : undefined);
   const latestRound = item.latest_round as Json | undefined;
   const lastRound = latestRound
     ? {
@@ -334,6 +941,8 @@ function instanceFromWire(item: Json, detail = false): RagInstanceDetail {
       : undefined,
     latestJob: detail ? latestJob : undefined,
     fullReindexJob: detail ? fullReindexJob : undefined,
+    retuningSignal: retuningSignalFromWire(item),
+    candidateExploration: candidateExplorationFromWire(item),
     lastRound,
   };
 }
@@ -422,7 +1031,9 @@ export const ragApi = {
   async latestEmbeddingBenchmark(): Promise<EmbeddingBenchmark | undefined> {
     try {
       return benchmarkFromWire(await request<Json>('/api/v1/embedding-benchmarks/latest'));
-    } catch {
+    } catch (error) {
+      if (error instanceof ApiRequestError && error.status === 404) return undefined;
+      fallbackOnlyWithoutApi(error);
       return undefined;
     }
   },
@@ -430,7 +1041,8 @@ export const ragApi = {
     try {
       const data = await request<{ services?: Json[]; items?: Json[] }>('/api/v1/model-runtime');
       return (data.services ?? data.items ?? []).map(serviceFromWire);
-    } catch {
+    } catch (error) {
+      fallbackOnlyWithoutApi(error);
       await wait();
       return [
         {
@@ -448,7 +1060,8 @@ export const ragApi = {
   async executionPlan(id: string): Promise<ExecutionPlan> {
     try {
       return planFromWire(await request<Json>(`/api/v1/rag-instances/${id}/execution-plan`));
-    } catch {
+    } catch (error) {
+      fallbackOnlyWithoutApi(error);
       await wait();
       return {
         embeddingModel: 'BGE-M3',
@@ -485,7 +1098,8 @@ export const ragApi = {
         },
       );
       return data.items.map(recommendationFromWire);
-    } catch {
+    } catch (error) {
+      fallbackOnlyWithoutApi(error);
       await wait();
       return fallbackRecommendations(questionnaire);
     }
@@ -494,7 +1108,8 @@ export const ragApi = {
     try {
       const data = await request<{ items: Json[] }>('/api/v1/rag-instances');
       return data.items.map((item) => instanceFromWire(item));
-    } catch {
+    } catch (error) {
+      fallbackOnlyWithoutApi(error);
       await wait();
       return localInstances;
     }
@@ -502,7 +1117,8 @@ export const ragApi = {
   async get(id: string): Promise<RagInstanceDetail> {
     try {
       return instanceFromWire(await request<Json>(`/api/v1/rag-instances/${id}`), true);
-    } catch {
+    } catch (error) {
+      fallbackOnlyWithoutApi(error);
       await wait();
       return localInstances.find((item) => item.id === id) ?? localInstances[0];
     }
@@ -515,7 +1131,8 @@ export const ragApi = {
           body: JSON.stringify({ name: input.name, questionnaire: questionnaireFromInput(input) }),
         }),
       );
-    } catch {
+    } catch (error) {
+      fallbackOnlyWithoutApi(error);
       const created: RagInstanceDetail = {
         id: `rag-${Date.now()}`,
         name: input.name,
@@ -552,7 +1169,8 @@ export const ragApi = {
         body: JSON.stringify({ documents, reuse_finalized_pipeline: reuseFinalizedPipeline }),
       });
       return this.get(id);
-    } catch {
+    } catch (error) {
+      fallbackOnlyWithoutApi(error);
       await wait(450);
       const instance = localInstances.find((item) => item.id === id)!;
       instance.status = 'TUNING';
@@ -570,15 +1188,85 @@ export const ragApi = {
   async cancelJob(jobId: string): Promise<void> {
     try {
       await request(`/api/v1/rag-jobs/${jobId}/cancel`, { method: 'POST' });
-    } catch {
+    } catch (error) {
+      fallbackOnlyWithoutApi(error);
       await wait();
     }
   },
   async retryJob(jobId: string): Promise<void> {
     try {
       await request(`/api/v1/rag-jobs/${jobId}/retry`, { method: 'POST' });
-    } catch {
+    } catch (error) {
+      fallbackOnlyWithoutApi(error);
       await wait();
+    }
+  },
+  async jobs(id: string): Promise<RagProcessingJob[] | undefined> {
+    try {
+      const data = await request<{ items?: Json[] }>(`/api/v1/rag-instances/${id}/jobs`);
+      return (data.items ?? [])
+        .map(jobFromWire)
+        .filter((job): job is RagProcessingJob => Boolean(job));
+    } catch (error) {
+      fallbackOnlyWithoutApi(error);
+      // Job history is an optional operational view in mock mode.
+      return undefined;
+    }
+  },
+  async latestCandidateExploration(id: string): Promise<CandidateExploration | undefined> {
+    try {
+      const data = await request<{ items?: Json[] }>(
+        `/api/v1/rag-instances/${id}/candidate-exploration`,
+      );
+      const latest = data.items?.[0];
+      return latest ? candidateExplorationFromWire({ candidate_exploration: latest }) : undefined;
+    } catch (error) {
+      fallbackOnlyWithoutApi(error);
+      return undefined;
+    }
+  },
+  async startCandidateExploration(
+    id: string,
+    documentIds: string[],
+    question?: string,
+  ): Promise<CandidateExploration | undefined> {
+    try {
+      const data = await request<Json>(`/api/v1/rag-instances/${id}/candidate-exploration`, {
+        method: 'POST',
+        body: JSON.stringify({ document_ids: documentIds, question: question || undefined }),
+      });
+      return candidateExplorationFromWire(data);
+    } catch (error) {
+      fallbackOnlyWithoutApi(error);
+      return undefined;
+    }
+  },
+  async rollbackCandidateExploration(
+    explorationId: string,
+  ): Promise<CandidateExploration | undefined> {
+    try {
+      const data = await request<Json>(`/api/v1/candidate-exploration/${explorationId}/rollback`, {
+        method: 'POST',
+        body: JSON.stringify({}),
+      });
+      return candidateExplorationFromWire(data);
+    } catch (error) {
+      fallbackOnlyWithoutApi(error);
+      return undefined;
+    }
+  },
+  async restoreCandidateExploration(
+    explorationId: string,
+  ): Promise<CandidateExploration | undefined> {
+    try {
+      const data = await request<Json>(`/api/v1/candidate-exploration/${explorationId}/restore`, {
+        method: 'POST',
+        body: JSON.stringify({}),
+      });
+      return candidateExplorationFromWire(data);
+    } catch (error) {
+      fallbackOnlyWithoutApi(error);
+      return undefined;
     }
   },
   async compare(id: string, question: string, documentIds: string[]): Promise<ComparisonRound> {
@@ -594,7 +1282,8 @@ export const ragApi = {
           pipelineFromWire(result.candidate as Json, result),
         ),
       };
-    } catch {
+    } catch (error) {
+      fallbackOnlyWithoutApi(error);
       await wait(380);
       return {
         ...mockRound,
@@ -610,7 +1299,8 @@ export const ragApi = {
         method: 'POST',
         body: JSON.stringify({ candidate_ids: candidateIds }),
       });
-    } catch {
+    } catch (error) {
+      fallbackOnlyWithoutApi(error);
       await wait();
     }
   },
@@ -620,8 +1310,51 @@ export const ragApi = {
         method: 'POST',
         body: JSON.stringify({ document_id: documentId }),
       });
-    } catch {
+    } catch (error) {
+      fallbackOnlyWithoutApi(error);
       await wait();
+    }
+  },
+  async retune(id: string, documentIds: string[], reason?: string): Promise<RetuneStart> {
+    try {
+      const data = await request<Json>(`/api/v1/rag-instances/${id}/retune`, {
+        method: 'POST',
+        body: JSON.stringify({ document_ids: documentIds, reason }),
+      });
+      return {
+        job: jobFromWire(data.job as Json | undefined),
+        nextAction: typeof data.next_action === 'string' ? data.next_action : undefined,
+      };
+    } catch (error) {
+      fallbackOnlyWithoutApi(error);
+      await wait();
+      return { nextAction: 'TUNE_DOCUMENT' };
+    }
+  },
+  async reparseDocument(id: string, documentId: string): Promise<void> {
+    try {
+      await request(`/api/v1/rag-instances/${id}/documents/${documentId}/reparse`, {
+        method: 'POST',
+        body: JSON.stringify({}),
+      });
+    } catch (error) {
+      fallbackOnlyWithoutApi(error);
+      await wait();
+    }
+  },
+  async preflightSearch(id: string, documentIds: string[]): Promise<void> {
+    if (!baseUrl) return;
+    const query = new URLSearchParams();
+    documentIds.forEach((documentId) => query.append('document_ids', documentId));
+    try {
+      const data = await request<Json>(
+        `/api/v1/rag-instances/${id}/search/preflight?${query.toString()}`,
+      );
+      if (data.eligible !== true) throw preflightConflictFromPayload(data, documentIds);
+    } catch (error) {
+      if (error instanceof ApiRequestError && [404, 405].includes(error.status)) return;
+      if (error instanceof SearchPreflightError) throw error;
+      throw preflightConflict(error, documentIds);
     }
   },
   async answer(
@@ -637,14 +1370,15 @@ export const ragApi = {
       });
       return {
         text: String(data.answer),
-        citations: ((data.citations as Json[]) ?? []).map(citationFromWire),
+        citations: citationsFromWire(data),
         latencyMs: 0,
         artifactId: String((data.artifact as Json | undefined)?.id ?? '') || undefined,
         runtime: runtimeFromWire(data.retrieval_metadata as Json | undefined, undefined),
         generation: generationFromWire(data),
         documentCoverage: coverageFromWire(data),
       };
-    } catch {
+    } catch (error) {
+      fallbackOnlyWithoutApi(error);
       await wait(400);
       return {
         text: question.includes('숙박')
@@ -670,6 +1404,7 @@ export const ragApi = {
     if (!baseUrl || typeof EventSource === 'undefined') {
       return abortable(this.answer(id, question, documentIds, sensitivity), options.signal);
     }
+    await this.preflightSearch(id, documentIds);
     const query = new URLSearchParams({ question, sensitivity });
     documentIds.forEach((documentId) => query.append('document_ids', documentId));
     return new Promise((resolve, reject) => {
@@ -689,7 +1424,14 @@ export const ragApi = {
         callback();
       };
       const abort = () =>
-        finish(() => reject(new DOMException('답변 생성을 중단했어요.', 'AbortError')));
+        finish(() =>
+          reject(
+            new DOMException(
+              '이 화면의 답변 표시를 중단했어요. 서버 작업은 계속될 수 있어요.',
+              'AbortError',
+            ),
+          ),
+        );
       const publish = () => options.onUpdate?.({ text, citations, generation });
       const updateGeneration = (event: Event) => {
         try {
@@ -730,7 +1472,7 @@ export const ragApi = {
           }
           resolve({
             text,
-            citations,
+            citations: enrichCitationDocuments(citations, metadata),
             latencyMs: Date.now() - startedAt,
             artifactId: String(metadata.artifact_id ?? '') || undefined,
             runtime: runtimeFromWire(metadata.retrieval_metadata as Json | undefined, undefined),
@@ -764,14 +1506,16 @@ export const ragApi = {
           citation_ids: context?.citationIds,
         }),
       });
-    } catch {
+    } catch (error) {
+      fallbackOnlyWithoutApi(error);
       await wait();
     }
   },
   async deleteDocument(id: string, documentId: string): Promise<void> {
     try {
       await request(`/api/v1/rag-instances/${id}/documents/${documentId}`, { method: 'DELETE' });
-    } catch {
+    } catch (error) {
+      fallbackOnlyWithoutApi(error);
       await wait();
     }
   },

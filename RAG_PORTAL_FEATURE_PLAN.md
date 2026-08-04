@@ -29,21 +29,22 @@
 | 08 | 🟡 | P0 | 대형 문서 업로드 → 비교 | 실제 대형 PDF/DOCX로 sample/full 재인덱싱 E2E | 실제 모델 runtime | 범위·비용·재인덱싱 상태가 실제 파일에서도 정확함 |
 | 09 | 🟡 | P1 | 비교·검색 → grounded 답변 | 실제 generator endpoint latency·취소·잘못된 citation fallback smoke | 실제 generator runtime | 제공 citation 밖의 모델 문장이 노출되지 않음 |
 | 10 | 🟡 | P1 | 여러 문서 → 답변 | 실제 다문서 corpus에서 정규화·rerank·종합 citation 품질 E2E | 07, 09 | 서로 다른 파이프라인의 근거가 하나의 답변에 보존됨 |
-| 11 | 다음 | **P0 release gate** | 모델 준비 → 릴리스 | 실제 모델 기동, provider smoke, 모델 미준비·지연·OCR/후보 실패·대형 문서·재방문 E2E | 06–10 | 필수 서비스 `READY`, happy/recovery path 자동 검증 |
-| 12 | 대기 | P1 | 피드백 → 재튜닝 | 피드백·benchmark 기반 임계값 보정, 전후 품질 비교, 추천 사유 UI | 07, 11 | 운영자가 재튜닝 효과를 비교 가능 |
-| 13 | 대기 | P1 | 문서 관리 → 재방문 | multipart/object storage, checksum·중복 처리, parser/chunk/model 버전, 재파싱 | 08, 11 | 원본 복구·재처리·재현 가능 |
-| 14 | 대기 | P1 | job 실행 → 운영 | 운영 DB + Redis/SQS worker, 취소·멱등성·재시도·dead-letter·관측성 | 06, 11 | 다중 worker·장애 복구에서도 상태 일관성 보장 |
-| 15 | 대기 | P2 | 후보 비교 → 개인화 | 상위 후보 축소, 청킹 파라미터 미세 탐색, 되돌림·설명 | 07, 12 | 탐색 비용을 줄이며 근거·되돌림 보존 |
+| 11 | 🟡 구현·자동 QA 완료 / runtime gate 대기 | **P0 release gate** | 모델 준비 → 릴리스 | 실제 모델 기동, provider smoke, 모델 미준비·지연·OCR/후보 실패·대형 문서·재방문 E2E | 06–10 | endpoint가 준비되면 `release_gate.sh`로 happy/recovery path 확인 |
+| 12 | ✅ 구현·자동 QA 완료 | P1 | 피드백 → 재튜닝 | 피드백·stored answer facts 기반 임계값 보정, 전후 artifact, 추천 사유 UI | 07, 11 구현 | 운영자가 재튜닝 효과를 비교 가능; 실제 benchmark/runtime 근거는 release gate 뒤 확인 |
+| 13 | ✅ 구현·자동 QA 완료 | P1 | 문서 관리 → 재방문 | immutable source storage adapter, checksum·중복 처리, parser/chunk/model 버전, 재파싱 | 08, 11 | 원본 복구·재처리·재현 가능; 실제 object storage gateway smoke는 운영 gate |
+| 14 | ✅ 구현·자동 QA 완료 | P1 | job 실행 → 운영 | durable job state, Redis/SQS-compatible dispatch, 멱등성·재시도·dead-letter·관측성 | 06, 11 | 다중 worker·장애 복구 상태 계약 보장; 실제 broker/worker smoke는 운영 gate |
+| 15 | ✅ 구현·자동 QA 완료 | P2 | 후보 비교 → 개인화 | bounded 후보 축소·파라미터 제안·ledger·명시적 되돌림 | 07, 12 | 탐색 비용을 줄이고 근거·되돌림 보존, 자동 선택·확정 없음 |
 
-### 0.3 재개용 권장 다음 스프린트 — Sprint 11 Release Gate
+### 0.3 재개용 권장 다음 스프린트 — 실제 Runtime·운영 Release Gate
 
-다음 작업 지시는 **Sprint 11**부터 시작한다. 새로운 기능보다 실제 모델과 실제 파일로 Sprint 06–10의 계약을 릴리스 가능 상태로 검증하는 것이 우선이다.
+Sprint 12–15의 코드·자동 QA까지 완료된 현재, 다음 작업은 새 기능보다 **실제 모델·실제 파일·실제 broker/object storage로 Sprint 07–15 계약을 릴리스 가능 상태로 검증**하는 것이다. 개발용 fallback이나 mock 결과는 성공으로 간주하지 않는다.
 
 1. BGE-M3, reranker, generator, Tesseract를 기동하고 `model-runtime`·각 인스턴스 `execution-plan`의 필수 서비스가 모두 `READY`인지 확인한다.
 2. 대표 문서 10–20개와 golden 질문·정답 근거를 versioned fixture로 확정하고 benchmark를 다시 실행한다.
 3. 단일·대형·다문서·스캔 문서로 업로드 → 비교 → 확정 → 검색 E2E를 실행한다.
-4. 모델 미준비, endpoint timeout, OCR 실패, 잘못된 generator citation, 후보 부분 실패, 재시작 복원을 자동화한다.
-5. Sprint 11 release gate를 통과한 뒤 Sprint 12의 피드백 기반 재튜닝으로 진행한다.
+4. Redis/SQS 중 하나와 object storage gateway를 기동하고, worker consumer·멱등성·재시도·dead-letter 복구·source 재파싱을 실제 서비스 경계에서 검증한다.
+5. 모델 미준비, endpoint timeout, OCR 실패, 잘못된 generator citation, 후보 부분 실패, 재시작 복원, worker 장애를 자동화한다.
+6. 실측 benchmark와 feedback/retuning, adaptive exploration의 evidence boundary를 검토한다. 탐색 제안은 사용자 확인 없이 확정되지 않아야 한다.
 
 모델 endpoint가 없는 로컬 CI에서는 test double로 동일 계약을 검증한다. 구축된 개발 서버에서는 fallback 결과를 성공으로 간주하지 않는다. 모델 서버 구축 기준은 [`docs/MODEL_RUNTIME_DEPLOYMENT.md`](./docs/MODEL_RUNTIME_DEPLOYMENT.md)를 따른다.
 
@@ -92,13 +93,15 @@
 | Sprint 08 | 완료 | 대형 문서 샘플 비교와 확정 뒤 전체 재인덱싱 | chunk 임계값 정책, sample/full job 상태, UI·회귀 테스트 | 실제 대형 파일 E2E |
 | Sprint 09 | 완료 | grounded generation·citation 검증·SSE | generator contract, fallback metadata, stream UI·회귀 테스트 | 다문서 retrieval 병합 |
 | Sprint 10 | 구현 완료 | 다문서 grounded 검색 | 전역 점수 병합, 다문서 citation, 종합 생성 UI | 실제 모델 smoke와 P1 QA |
-| Sprint 11 | 다음 | 실제 모델·실제 파일 release gate | runtime smoke, golden corpus 확대, 실패·복구 E2E | 피드백 기반 재튜닝 |
-| Sprint 12 | 대기 | 피드백 기반 재튜닝 | 임계값 보정, 품질 전후 비교, 추천 사유 | 원본 파일·운영 플랫폼 강화 |
-| Sprint 13 | 대기 | 원본 파일·재현성 | object storage, versioning, 재파싱 | 운영 worker 전환 |
-| Sprint 14 | 대기 | 운영 job 플랫폼 | DB/Redis/SQS, 멱등성, dead-letter, 관측성 | 적응형 개인화 |
-| Sprint 15 | 대기 | 적응형 후보 탐색 | 후보 축소, 파라미터 탐색, 되돌림 | 제품 고도화 backlog |
+| Sprint 11 | 🟡 구현·자동 QA 완료 / 실제 runtime gate 대기 | 실제 모델·실제 파일 release gate | runtime smoke, golden corpus 확대, 실패·복구 E2E | 모델 endpoint가 준비되면 `release_gate.sh` 실행 후 완료 처리 |
+| Sprint 12 | ✅ 구현·자동 QA 완료 | 피드백 기반 재튜닝 | explainable recommendation, baseline/outcome artifact, explicit 실행 UI | 실제 benchmark/runtime release gate |
+| Sprint 13 | ✅ 구현·자동 QA 완료 | 원본 파일·재현성 | source storage adapter, SHA-256 dedup, provenance, reparse artifact | 실제 object storage smoke |
+| Sprint 14 | ✅ 구현·자동 QA 완료 | 운영 job 플랫폼 | durable dispatch receipt/idempotency, heartbeat, retry/backoff, dead-letter/recovery | 실제 Redis/SQS worker smoke |
+| Sprint 15 | ✅ 구현·자동 QA 완료 | 적응형 후보 탐색 | exploration ledger, bounded proposals, explicit rollback/restore, no auto-finalize | 실측 evidence·사용성 release review |
 
 Sprint 완료 시에는 항상 이 표, 해당 `docs/SPRINT_XX_*.md`, 자동 검증 기록을 함께 갱신한다. 모델 endpoint가 없는 로컬 CI에서는 network 호출을 mock/test double로 검증하고, 개발 서버에서는 같은 API 계약으로 smoke test를 별도 실행한다.
+
+**Sprint 07–15 통합 QA (2026-08-03):** backend 34 passed / external release gate 2 skipped, frontend 31 passed / format·build 통과. P0 반응형 drawer·재파싱 선택 범위·표시 중단 문구와 P1 대형 문서 exploration sample 경계·SSE preflight·운영 API mock fallback을 보완했다. 상세 근거는 [`docs/SPRINT_07_15_BACKEND_QA.md`](./docs/SPRINT_07_15_BACKEND_QA.md), [`docs/design/SPRINT_07_15_FRONTEND_QA.md`](./docs/design/SPRINT_07_15_FRONTEND_QA.md), [`docs/design/SPRINT_07_15_UX_QA.md`](./docs/design/SPRINT_07_15_UX_QA.md)를 따른다.
 
 ---
 

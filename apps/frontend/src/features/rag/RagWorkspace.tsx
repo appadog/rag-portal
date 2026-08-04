@@ -145,6 +145,37 @@ const ComparisonScopeNotice = styled.section`
     gap: var(--rp-space-2);
   }
 `;
+const ExplorationNotice = styled.section`
+  display: grid;
+  gap: var(--rp-space-3);
+  margin: 0 0 var(--rp-space-4);
+  padding: var(--rp-space-3);
+  border: 1px solid var(--rp-border);
+  border-radius: var(--rp-radius-sm);
+  background: var(--rp-surface-subtle);
+  h2 {
+    margin: 0;
+    font-size: var(--rp-font-size-15);
+  }
+  p,
+  li {
+    margin: 0;
+    color: var(--rp-ink-subtle);
+    font-size: var(--rp-font-size-13);
+    line-height: var(--rp-line-normal);
+  }
+  ul {
+    display: grid;
+    gap: var(--rp-space-1);
+    margin: 0;
+    padding-left: var(--rp-space-4);
+  }
+  .exploration-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--rp-space-2);
+  }
+`;
 const CandidateSwitcher = styled.div`
   display: none;
   gap: var(--rp-space-2);
@@ -494,6 +525,7 @@ function Candidate({
   onOpen,
   onRetryPreparation,
   canRetryPreparation,
+  proposed,
 }: {
   candidate: PipelineCandidate;
   selected: boolean;
@@ -501,6 +533,7 @@ function Candidate({
   onOpen: (candidate: PipelineCandidate, trigger: HTMLElement) => void;
   onRetryPreparation: () => void;
   canRetryPreparation: boolean;
+  proposed?: boolean;
 }) {
   const state = candidate.comparisonState ?? (candidate.evidence.length ? 'READY' : 'NO_EVIDENCE');
   const selectable = state === 'READY';
@@ -537,7 +570,7 @@ function Candidate({
     <CandidateCard
       $selected={selected}
       aria-busy={state === 'PREPARING'}
-      aria-label={`${candidate.label}, ${stateCopy.label}, ${selectable ? '선택 가능' : '선택할 수 없음'}, 현재 ${candidate.selectionCount}회 선택`}
+      aria-label={`${candidate.label}, ${proposed ? '탐색 제안, 자동 선택 안 함, ' : ''}${stateCopy.label}, ${selectable ? '선택 가능' : '선택할 수 없음'}, 현재 ${candidate.selectionCount}회 선택`}
     >
       <div className="candidate-header">
         <input
@@ -563,6 +596,7 @@ function Candidate({
             {candidate.chunkCount ? ` · 근거 조각 ${candidate.chunkCount}개` : ''}
           </span>
           <Pill $tone={stateCopy.tone}>{stateCopy.label}</Pill>
+          {proposed && <Pill $tone="muted">탐색 제안 · 자동 선택 안 함</Pill>}
         </div>
       </div>
       {!selectable ? (
@@ -654,6 +688,23 @@ function useMediaQuery(query: string) {
   return matches;
 }
 
+function explorationPhaseCopy(phase: string) {
+  const normalized = phase.toUpperCase();
+  if (normalized.includes('RESTOR')) return '이전 후보군 복원됨';
+  if (normalized.includes('NARROW')) return '제안 범위를 정리했어요';
+  if (normalized.includes('PROPOS')) return '비교 후보를 제안했어요';
+  if (normalized.includes('READY')) return '후보 탐색 준비됨';
+  return '후보를 탐색하고 있어요';
+}
+
+function explorationEvidenceCopy(state: 'MEASURED' | 'FALLBACK' | 'MISSING' | 'PENDING') {
+  if (state === 'MEASURED') return '제공된 비교 관찰을 참고했어요. 제안은 선택을 대신하지 않아요.';
+  if (state === 'FALLBACK')
+    return '개발용 fallback 또는 불완전 결과는 품질 근거로 사용하지 않아요.';
+  if (state === 'PENDING') return '비교 관찰을 준비 중이며, 현재 제안은 확정이 아니에요.';
+  return '실측 benchmark·runtime 정보가 제공되지 않아 탐색 근거에 포함하지 않았어요.';
+}
+
 export function RagSetupPage() {
   const { id = '' } = useParams();
   const navigate = useNavigate();
@@ -669,6 +720,9 @@ export function RagSetupPage() {
   const [finalizeSubmitting, setFinalizeSubmitting] = useState(false);
   const [compareError, setCompareError] = useState<string>();
   const [finalizeError, setFinalizeError] = useState<string>();
+  const [restoringExploration, setRestoringExploration] = useState(false);
+  const [explorationRestoreStatus, setExplorationRestoreStatus] = useState<string>();
+  const [explorationStarting, setExplorationStarting] = useState(false);
   const evidenceTriggerRef = useRef<HTMLElement | null>(null);
   const confirmTriggerRef = useRef<HTMLElement | null>(null);
   const evidenceDialogRef = useRef<HTMLElement | null>(null);
@@ -679,8 +733,9 @@ export function RagSetupPage() {
     const sync = async () => {
       try {
         const item = await ragApi.get(id);
+        const exploration = await ragApi.latestCandidateExploration(id);
         if (cancelled) return;
-        setDetail(item);
+        setDetail({ ...item, candidateExploration: exploration ?? item.candidateExploration });
         if (item.lastRound) {
           setRound(item.lastRound);
           return;
@@ -821,6 +876,81 @@ export function RagSetupPage() {
       setFinalizeError((item as Error).message);
     } finally {
       setFinalizeSubmitting(false);
+    }
+  };
+  const restoreExploration = async () => {
+    if (!detail?.candidateExploration?.rollback?.canRestore || restoringExploration) return;
+    setRestoringExploration(true);
+    setExplorationRestoreStatus(undefined);
+    try {
+      const restored = await ragApi.restoreCandidateExploration(detail.candidateExploration.id);
+      if (!restored) {
+        setExplorationRestoreStatus(
+          '현재 연결에서는 이전 후보군 복원을 지원하지 않아요. 기존 후보 비교는 계속할 수 있어요.',
+        );
+      } else {
+        const updated = await ragApi.get(id);
+        setDetail({ ...updated, candidateExploration: restored });
+        if (updated.lastRound) setRound(updated.lastRound);
+        setSelected([]);
+        setExplorationRestoreStatus(
+          '이전 후보군을 복원했어요. 후보를 다시 직접 선택해 비교해 주세요.',
+        );
+      }
+    } catch {
+      setExplorationRestoreStatus(
+        '이전 후보군을 복원하지 못했어요. 기존 후보 비교는 그대로 유지돼요.',
+      );
+    } finally {
+      setRestoringExploration(false);
+    }
+  };
+  const rollbackExploration = async () => {
+    if (!detail?.candidateExploration?.rollback?.canRollback || restoringExploration) return;
+    setRestoringExploration(true);
+    setExplorationRestoreStatus(undefined);
+    try {
+      const rolledBack = await ragApi.rollbackCandidateExploration(detail.candidateExploration.id);
+      if (!rolledBack) {
+        setExplorationRestoreStatus(
+          '현재 연결에서는 제안 후보 되돌리기를 지원하지 않아요. 기존 후보 비교는 계속할 수 있어요.',
+        );
+      } else {
+        const updated = await ragApi.get(id);
+        setDetail({ ...updated, candidateExploration: rolledBack });
+        setSelected([]);
+        setExplorationRestoreStatus(
+          '제안 후보만 되돌렸어요. 기존 후보와 확정 결과는 바뀌지 않았어요.',
+        );
+      }
+    } finally {
+      setRestoringExploration(false);
+    }
+  };
+  const startExploration = async () => {
+    if (!detail || explorationStarting) return;
+    setExplorationStarting(true);
+    setExplorationRestoreStatus(undefined);
+    try {
+      const exploration = await ragApi.startCandidateExploration(
+        id,
+        detail.documents.map((document) => document.id),
+        question || round?.question,
+      );
+      if (!exploration) {
+        setExplorationRestoreStatus(
+          '현재 연결에서는 후보 탐색 제안을 준비하지 못했어요. 기존 후보 비교는 계속할 수 있어요.',
+        );
+      } else {
+        setDetail((current) =>
+          current ? { ...current, candidateExploration: exploration } : current,
+        );
+        setExplorationRestoreStatus(
+          '탐색 제안을 준비했어요. 제안 후보는 자동 선택되지 않으니 다음 비교에서 직접 확인해 주세요.',
+        );
+      }
+    } finally {
+      setExplorationStarting(false);
     }
   };
   const closeEvidence = () => {
@@ -998,6 +1128,77 @@ export function RagSetupPage() {
           </div>
         </ComparisonScopeNotice>
       )}
+      {!detail.candidateExploration && (
+        <ExplorationNotice aria-label="적응형 후보 탐색" role="region">
+          <h2>후보 탐색</h2>
+          <p>
+            현재 후보를 바꾸지 않고, 비교할 변형 후보를 제안받을 수 있어요. 제안은 자동 선택이나
+            확정을 하지 않아요.
+          </p>
+          <Button
+            $variant="secondary"
+            onClick={() => void startExploration()}
+            disabled={explorationStarting}
+          >
+            {explorationStarting ? '탐색 제안 준비 중…' : '후보 탐색 제안 만들기'}
+          </Button>
+          {explorationRestoreStatus && <p role="status">{explorationRestoreStatus}</p>}
+        </ExplorationNotice>
+      )}
+      {detail.candidateExploration && (
+        <ExplorationNotice aria-label="적응형 후보 탐색" role="region">
+          <div className="exploration-meta">
+            <Pill $tone="warning">{explorationPhaseCopy(detail.candidateExploration.phase)}</Pill>
+            <Pill $tone="muted">
+              후보 풀 {detail.candidateExploration.poolCount ?? counts.length}개
+            </Pill>
+            <Pill $tone="muted">
+              제안 범위 {detail.candidateExploration.proposedCandidateIds.length}개
+            </Pill>
+          </div>
+          <h2>후보 탐색 제안</h2>
+          {detail.candidateExploration.rationales.length ? (
+            <ul aria-label="파라미터 변경 근거">
+              {detail.candidateExploration.rationales.map((rationale, index) => (
+                <li key={`${rationale}-${index}`}>{rationale}</li>
+              ))}
+            </ul>
+          ) : (
+            <p>제안된 파라미터 변경 근거는 아직 제공되지 않았어요.</p>
+          )}
+          <p>{explorationEvidenceCopy(detail.candidateExploration.evidenceBoundary)}</p>
+          <p>
+            제안 후보는 아래 카드에 표시되지만 자동 선택되지 않아요. 근거를 보고 직접 고른 뒤
+            완료에서 한 번 더 확인해 주세요.
+          </p>
+          {detail.candidateExploration.proposedCandidates.length > 0 && (
+            <ul aria-label="제안된 후보">
+              {detail.candidateExploration.proposedCandidates.map((candidate) => (
+                <li key={candidate.id}>{candidate.label}</li>
+              ))}
+            </ul>
+          )}
+          {detail.candidateExploration.rollback?.canRollback && (
+            <Button
+              $variant="secondary"
+              onClick={() => void rollbackExploration()}
+              disabled={restoringExploration}
+            >
+              {restoringExploration ? '제안 후보 되돌리는 중…' : '제안 후보 되돌리기'}
+            </Button>
+          )}
+          {detail.candidateExploration.rollback?.canRestore && (
+            <Button
+              $variant="secondary"
+              onClick={() => void restoreExploration()}
+              disabled={restoringExploration}
+            >
+              {restoringExploration ? '이전 후보군 복원 중…' : '이전 후보군 복원하기'}
+            </Button>
+          )}
+          {explorationRestoreStatus && <p role="status">{explorationRestoreStatus}</p>}
+        </ExplorationNotice>
+      )}
       <CompareControls>
         <Input
           aria-label="비교할 질문"
@@ -1053,6 +1254,7 @@ export function RagSetupPage() {
             }}
             onRetryPreparation={() => void retryPreparation()}
             canRetryPreparation={Boolean(detail.latestJob?.canRetry)}
+            proposed={detail.candidateExploration?.proposedCandidateIds.includes(candidate.id)}
           />
         ))}
       </CompareGrid>

@@ -2,6 +2,7 @@ import base64
 from io import BytesIO
 import time
 
+import pytest
 from fastapi.testclient import TestClient
 from docx import Document as DocxDocument
 import fitz
@@ -11,6 +12,7 @@ from app import main
 from app.generation import GenerationEndpointError, GenerationResult, GenerationSentence
 from app.main import app
 from app.retrieval import bm25_scores, embed, rank
+from app.source_storage import source_storage
 
 
 client = TestClient(app)
@@ -26,6 +28,15 @@ def test_openapi_includes_workspace_state_contract() -> None:
     assert "/api/v1/model-runtime" in paths
     assert "/api/v1/rag-instances/{instance_id}/execution-plan" in paths
     assert "/api/v1/large-document-policy" in paths
+    assert "/api/v1/rag-instances/{instance_id}/documents/{document_id}/reparse" in paths
+    assert "/api/v1/rag-instances/{instance_id}/retuning-recommendation" in paths
+    assert "/api/v1/job-platform" in paths
+    assert "/api/v1/rag-jobs/dead-letters" in paths
+    assert "/api/v1/rag-jobs/{job_id}/recover" in paths
+    assert "/api/v1/rag-instances/{instance_id}/candidate-exploration" in paths
+    assert "/api/v1/candidate-exploration/{exploration_id}/rollback" in paths
+    assert "/api/v1/candidate-exploration/{exploration_id}/restore" in paths
+    assert "/api/v1/rag-instances/{instance_id}/search/preflight" in paths
 
 
 def test_large_document_policy_defaults_to_500_chunks(monkeypatch) -> None:
@@ -193,6 +204,194 @@ def test_processing_job_can_be_cancelled_and_retried() -> None:
     assert retried.status_code == 200
     assert retried.json()["attempt"] == 2
     assert wait_for_job(job_id)["state"] == "SUCCEEDED"
+
+
+def test_operational_job_contract_dead_letters_and_explicit_recovery(monkeypatch) -> None:
+    instance_id = create_instance()
+    job = main.ProcessingJob(
+        id=main.new_id(),
+        instance_id=instance_id,
+        document_ids=[],
+        state=main.JobState.FAILED,
+        current_step="실패",
+        completed_units=0,
+        total_units=3,
+        created_at=main.datetime.now(main.UTC),
+        max_attempts=2,
+        attempt=2,
+    )
+    main.ensure_job_operational_fields(job)
+    main.JOBS[job.id] = job
+    main.mark_job_failure(job, "테스트 실패")
+    assert job.state == main.JobState.DEAD_LETTER
+
+    payload = client.get(f"/api/v1/rag-jobs/{job.id}")
+    assert payload.status_code == 200
+    assert payload.json()["can_recover"] is True
+    assert payload.json()["operational"]["dead_letter_reason"] == "MAX_ATTEMPTS_EXHAUSTED"
+
+    dead_letters = client.get("/api/v1/rag-jobs/dead-letters")
+    assert dead_letters.status_code == 200
+    assert any(item["id"] == job.id for item in dead_letters.json()["items"])
+
+    dispatched: list[str] = []
+    monkeypatch.setattr(main, "start_processing_job", lambda recovered, *_: dispatched.append(recovered.id))
+    recovered = client.post(f"/api/v1/rag-jobs/{job.id}/recover")
+    assert recovered.status_code == 200
+    assert recovered.json()["state"] == "QUEUED"
+    assert recovered.json()["attempt"] == 1
+    assert dispatched == [job.id]
+
+
+def test_job_retry_backoff_and_cancellation_checkpoint() -> None:
+    instance_id = create_instance()
+    job = main.ProcessingJob(
+        id=main.new_id(),
+        instance_id=instance_id,
+        document_ids=[],
+        state=main.JobState.FAILED,
+        current_step="실패",
+        completed_units=0,
+        total_units=3,
+        created_at=main.datetime.now(main.UTC),
+        max_attempts=3,
+        retry_backoff_seconds=60,
+    )
+    main.ensure_job_operational_fields(job)
+    main.mark_job_failure(job, "일시 오류")
+    main.JOBS[job.id] = job
+    blocked = client.post(f"/api/v1/rag-jobs/{job.id}/retry")
+    assert blocked.status_code == 409
+    assert blocked.json()["detail"]["code"] == "JOB_RETRY_BACKOFF"
+
+    job.cancel_requested = True
+    with pytest.raises(main.JobCancelled):
+        main.ensure_job_is_active(job)
+    assert job.last_heartbeat_at is not None
+
+
+def test_job_platform_reports_local_adapter_fallback(monkeypatch) -> None:
+    monkeypatch.setenv("RAG_QUEUE_BACKEND", "unsupported-adapter")
+    response = client.get("/api/v1/job-platform")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["queue"]["effective"] == "thread"
+    assert body["queue"]["ready"] is False
+
+
+def test_job_operational_environment_defaults_tolerate_invalid_values(monkeypatch) -> None:
+    monkeypatch.setenv("RAG_JOB_MAX_ATTEMPTS", "invalid")
+    monkeypatch.setenv("RAG_JOB_RETRY_BACKOFF_SECONDS", "invalid")
+    assert main.job_max_attempts() == 3
+    assert main.job_retry_backoff_seconds() == 0
+
+
+def test_adaptive_candidate_exploration_never_auto_selects_and_can_roll_back_restore() -> None:
+    instance_id = create_instance()
+    uploaded = client.post(
+        f"/api/v1/rag-instances/{instance_id}/documents",
+        json={"documents": [{"filename": "explore.txt", "content": "제1조 국내 출장 숙박비는 1박 10만원입니다. 제2조 식비는 1일 150달러입니다."}]},
+    ).json()
+    assert wait_for_job(uploaded["job"]["id"])["state"] == "SUCCEEDED"
+    document_id = uploaded["documents"][0]["id"]
+    document = main.INSTANCES[instance_id].documents[document_id]
+    initial_candidate_ids = list(document.candidate_ids)
+    initial_votes = {candidate_id: main.CANDIDATES[candidate_id].selection_count for candidate_id in initial_candidate_ids}
+
+    created = client.post(
+        f"/api/v1/rag-instances/{instance_id}/candidate-exploration",
+        json={"document_ids": [document_id], "question": "숙박비 한도는?", "max_proposals": 2},
+    )
+    assert created.status_code == 201
+    exploration = created.json()["candidate_exploration"]
+    assert exploration["selection"]["automatic"] is False
+    assert exploration["status"] == "PROPOSED"
+    assert len(exploration["pool"]) == len(initial_candidate_ids)
+    assert len(exploration["proposed"]) == 2
+    assert document.finalized_candidate_id is None
+    assert {candidate_id: main.CANDIDATES[candidate_id].selection_count for candidate_id in initial_candidate_ids} == initial_votes
+    assert all(item["candidate"]["exploration"]["round_id"] == exploration["id"] for item in exploration["proposed"])
+    provenance = client.get(f"/api/v1/rag-instances/{instance_id}").json()["documents"][0]["provenance"]["model"]
+    assert {item["candidate"]["retrieval_config"] for item in exploration["proposed"]} <= set(provenance["retrieval_configs"])
+
+    listed = client.get(f"/api/v1/rag-instances/{instance_id}/candidate-exploration")
+    assert listed.status_code == 200
+    assert listed.json()["items"][0]["id"] == exploration["id"]
+
+    rolled_back = client.post(f"/api/v1/candidate-exploration/{exploration['id']}/rollback")
+    assert rolled_back.status_code == 200
+    assert rolled_back.json()["candidate_exploration"]["status"] == "ROLLED_BACK"
+    assert all(main.CANDIDATES[candidate_id].archived for candidate_id in rolled_back.json()["archived_candidate_ids"])
+    assert all(candidate_id in document.candidate_ids for candidate_id in initial_candidate_ids)
+
+    restored = client.post(f"/api/v1/candidate-exploration/{exploration['id']}/restore")
+    assert restored.status_code == 200
+    assert restored.json()["candidate_exploration"]["status"] == "RESTORED"
+    assert all(not main.CANDIDATES[candidate_id].archived for candidate_id in restored.json()["restored_candidate_ids"])
+
+
+def test_exploration_preserves_large_document_sample_bound(monkeypatch) -> None:
+    monkeypatch.setenv("RAG_PORTAL_COMPARISON_CHUNK_THRESHOLD", "3")
+    instance_id = create_instance()
+    content = "\n\n".join(f"제{number}조 국내 출장 숙박비는 1박 10만원입니다." for number in range(1, 14))
+    uploaded = client.post(
+        f"/api/v1/rag-instances/{instance_id}/documents",
+        json={"documents": [{"filename": "large-explore.txt", "content": content}]},
+    ).json()
+    assert wait_for_job(uploaded["job"]["id"])["state"] == "SUCCEEDED"
+    document_id = uploaded["documents"][0]["id"]
+    exploration = client.post(
+        f"/api/v1/rag-instances/{instance_id}/candidate-exploration",
+        json={"document_ids": [document_id], "max_proposals": 2},
+    )
+    assert exploration.status_code == 201
+    proposed = exploration.json()["candidate_exploration"]["proposed"]
+    assert all(item["candidate"]["comparison"]["scope"] == "SAMPLE" for item in proposed)
+    assert all(item["candidate"]["chunk_count"] <= 3 for item in proposed)
+    assert all(item["candidate"]["comparison"]["estimated_chunk_count"] >= item["candidate"]["chunk_count"] for item in proposed)
+
+
+def test_search_preflight_reports_per_document_conflicts_without_generating(monkeypatch) -> None:
+    monkeypatch.setenv("RAG_PORTAL_COMPARISON_CHUNK_THRESHOLD", "3")
+    instance_id = create_instance()
+    content = "\n\n".join(f"제{number}조 국내 출장 숙박비는 1박 10만원입니다." for number in range(1, 14))
+    uploaded = client.post(
+        f"/api/v1/rag-instances/{instance_id}/documents",
+        json={"documents": [{"filename": "preflight-large.txt", "content": content}]},
+    ).json()
+    assert wait_for_job(uploaded["job"]["id"])["state"] == "SUCCEEDED"
+    document_id = uploaded["documents"][0]["id"]
+    compared = client.post(
+        f"/api/v1/rag-instances/{instance_id}/tuning/compare",
+        json={"document_ids": [document_id], "question": "숙박비는?"},
+    ).json()
+    winner = next(item for item in compared["results"] if item["candidate_state"] == "READY")
+    assert client.post(f"/api/v1/tuning-rounds/{compared['round']['id']}/vote", json={"candidate_ids": [winner["candidate"]["id"]]}).status_code == 200
+    monkeypatch.setattr(main, "start_full_reindex_job", lambda *_: None)
+    finalized = client.post(f"/api/v1/rag-instances/{instance_id}/tuning/finalize", json={"document_id": document_id})
+    assert finalized.status_code == 200
+    before_artifacts = len(main.INSTANCES[instance_id].artifact_ids)
+
+    preflight = client.get(
+        f"/api/v1/rag-instances/{instance_id}/search/preflight",
+        params=[("document_ids", document_id), ("document_ids", "missing-document")],
+    )
+    assert preflight.status_code == 200
+    body = preflight.json()
+    assert body["eligible"] is False
+    conflicts = {item["document_id"]: item for item in body["conflicts"]}
+    assert conflicts[document_id]["code"] == "FULL_REINDEX_PENDING"
+    assert conflicts[document_id]["action"] == "WAIT_FOR_FULL_REINDEX"
+    assert conflicts["missing-document"]["code"] == "DOCUMENT_NOT_FOUND"
+    assert conflicts["missing-document"]["action"] == "REMOVE_DOCUMENT"
+    assert len(main.INSTANCES[instance_id].artifact_ids) == before_artifacts
+
+    blocked_search = client.post(
+        f"/api/v1/rag-instances/{instance_id}/search",
+        json={"document_ids": [document_id], "question": "숙박비는?"},
+    )
+    assert blocked_search.status_code == 409
+    assert blocked_search.json()["detail"]["code"] == "FULL_REINDEX_PENDING"
 
 
 def test_bm25_dense_hybrid_and_rerank_use_the_prepared_vector_index() -> None:
@@ -750,10 +949,73 @@ def test_invalid_or_failed_generation_streams_explicit_extractive_fallback(monke
         params=[("question", "국내 출장 숙박비 한도는?"), ("document_ids", document_id)],
     )
     assert stream.status_code == 200
+    assert 'event: status' in stream.text
+    assert '"phase": "RETRIEVING"' in stream.text
+    assert '"phase": "ANSWER_READY"' in stream.text
     assert "event: citations" in stream.text
     assert "event: token" in stream.text
+    assert '"delivery": "BUFFERED_REPLAY"' in stream.text
     assert '"mode": "EXTRACTIVE_FALLBACK"' in stream.text
     assert '"fallback_reason": "GENERATOR_UNAVAILABLE"' in stream.text
+    assert '"server_cancellation": "disconnect_stops_future_events_but_does_not_interrupt_active_provider_request"' in stream.text
+
+
+def test_empty_generation_is_rejected_and_uses_cited_fallback(monkeypatch) -> None:
+    def empty_generator(*, question: str, contexts: list[dict]) -> GenerationResult:
+        return GenerationResult(sentences=[], provider="test-local-generator", model="test-grounded-model", latency_ms=1)
+
+    monkeypatch.setattr(main, "generate_grounded", empty_generator)
+    instance_id = create_instance()
+    document_id = finalize_single_document(instance_id)
+    response = client.post(
+        f"/api/v1/rag-instances/{instance_id}/search",
+        json={"document_ids": [document_id], "question": "국내 출장 숙박비 한도는?"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["generation"]["mode"] == "EXTRACTIVE_FALLBACK"
+    assert body["generation"]["fallback_reason"] == "INVALID_GROUNDING"
+    assert body["citations"]
+    assert set(item["segment_id"] for item in body["citations"]) <= set(body["generation"]["supplied_segment_ids"])
+
+    stream = client.get(
+        f"/api/v1/rag-instances/{instance_id}/search/stream",
+        params=[("question", "국내 출장 숙박비 한도는?"), ("document_ids", document_id)],
+    )
+    assert stream.status_code == 200
+    assert '"fallback_reason": "INVALID_GROUNDING"' in stream.text
+
+
+def test_full_reindex_search_policy_is_explicit_and_shared_by_rest_and_sse() -> None:
+    instance_id = create_instance()
+    document_id = finalize_single_document(instance_id)
+    document = main.INSTANCES[instance_id].documents[document_id]
+    document.comparison_scope = main.ComparisonScope.SAMPLE
+    document.full_reindex_job_id = "full-reindex-job"
+    document.full_reindex_state = main.JobState.QUEUED
+
+    detail = client.get(f"/api/v1/rag-instances/{instance_id}").json()["documents"][0]["full_reindex"]
+    assert detail["search_policy"] == "BLOCK_UNTIL_FULL_INDEX_SUCCEEDED"
+    assert detail["search_eligible"] is False
+    assert detail["next_action"] == "WAIT_FOR_FULL_REINDEX"
+
+    request = {"document_ids": [document_id], "question": "국내 출장 숙박비 한도는?"}
+    rest = client.post(f"/api/v1/rag-instances/{instance_id}/search", json=request)
+    assert rest.status_code == 409
+    assert rest.json()["detail"]["code"] == "FULL_REINDEX_PENDING"
+    assert rest.json()["detail"]["details"] == detail
+    stream = client.get(
+        f"/api/v1/rag-instances/{instance_id}/search/stream",
+        params=[("question", request["question"]), ("document_ids", document_id)],
+    )
+    assert stream.status_code == 409
+    assert stream.json()["detail"] == rest.json()["detail"]
+
+    document.full_reindex_state = main.JobState.FAILED
+    failed = client.post(f"/api/v1/rag-instances/{instance_id}/search", json=request)
+    assert failed.status_code == 409
+    assert failed.json()["detail"]["code"] == "FULL_REINDEX_FAILED"
+    assert failed.json()["detail"]["details"]["next_action"] == "RETRY_FULL_REINDEX"
 
 
 def test_multi_document_search_normalizes_per_document_scores_and_groups_grounded_citations(monkeypatch) -> None:
@@ -859,3 +1121,162 @@ def test_multi_document_invalid_generation_falls_back_only_to_selected_evidence(
     assert "검증되지 않은 모델 문장" not in body["answer"]
     assert len(body["citations"]) == 2
     assert set(citation["segment_id"] for citation in body["citations"]) <= set(body["generation"]["supplied_segment_ids"])
+
+
+def test_retuning_recommendation_is_explainable_and_persists_baseline_and_outcome() -> None:
+    instance_id = create_instance()
+    document_id = finalize_single_document(instance_id)
+    searched = client.post(
+        f"/api/v1/rag-instances/{instance_id}/search",
+        json={"document_ids": [document_id], "question": "국내 출장 숙박비 한도는?"},
+    ).json()
+    # A fallback/partial benchmark is visible as runtime context only. It must
+    # never become a fabricated model-quality score in the recommendation.
+    main.BENCHMARK_RUNS.append(
+        {
+            "run": {"id": "fallback-benchmark", "created_at": main.now(), "corpus_label": "test"},
+            "results": [{"model_id": "BGE-M3", "status": "FALLBACK", "provider": "local-hash-fallback", "dimension": 96}],
+        }
+    )
+    for _ in range(2):
+        response = client.post(
+            f"/api/v1/rag-instances/{instance_id}/feedback",
+            json={
+                "rating": -1,
+                "artifact_id": searched["artifact"]["id"],
+                "document_ids": [document_id],
+                "citation_ids": [citation["id"] for citation in searched["citations"]],
+            },
+        )
+        assert response.status_code == 201
+
+    recommendation = client.get(f"/api/v1/rag-instances/{instance_id}/retuning-recommendation")
+    assert recommendation.status_code == 200
+    signal = recommendation.json()
+    assert signal["version"] == main.RETUNING_SIGNAL_VERSION
+    assert signal["recommended"] is True
+    assert signal["inputs"]["feedback"]["negative_recency_weight"] == 2.0
+    assert signal["inputs"]["benchmark_provider"]["status"] == "NOT_RELEASE_EVIDENCE"
+    assert signal["inputs"]["benchmark_provider"]["used_for_recommendation_score"] is False
+    assert "BENCHMARK_NOT_QUALITY_EVIDENCE" in signal["recommendation_reasons"]
+    assert signal["baseline_snapshot"]["document_ids"] == [document_id]
+    assert signal["baseline_snapshot"]["selected_pipelines"][0]["pipeline"]["finalized"] is True
+    summary = client.get(f"/api/v1/rag-instances/{instance_id}/feedback-summary").json()
+    assert summary["retuning_recommendation"]["version"] == signal["version"]
+
+    retune = client.post(
+        f"/api/v1/rag-instances/{instance_id}/retune",
+        json={"document_ids": [document_id], "reason": "feedback and evidence review"},
+    )
+    assert retune.status_code == 202
+    retune_body = retune.json()
+    baseline = client.get(
+        f"/api/v1/rag-instances/{instance_id}/artifacts/{retune_body['baseline_artifact']['id']}"
+    ).json()
+    assert baseline["type"] == "RETUNING_BASELINE"
+    assert baseline["payload"]["recommendation"]["version"] == main.RETUNING_SIGNAL_VERSION
+    assert baseline["payload"]["selected_pipelines"][0]["document_id"] == document_id
+    assert wait_for_job(retune_body["job"]["id"])["state"] == "SUCCEEDED"
+
+    compared = client.post(
+        f"/api/v1/rag-instances/{instance_id}/tuning/compare",
+        json={"document_ids": [document_id], "question": "국내 출장 숙박비 한도는?"},
+    )
+    assert compared.status_code == 200
+    comparison = compared.json()
+    assert comparison["retuning_outcome_artifact"] is not None
+    outcome = client.get(
+        f"/api/v1/rag-instances/{instance_id}/artifacts/{comparison['retuning_outcome_artifact']['id']}"
+    ).json()
+    assert outcome["type"] == "RETUNING_OUTCOME"
+    assert outcome["metadata"]["baseline_artifact_id"] == retune_body["baseline_artifact"]["id"]
+    assert outcome["metadata"]["selection_state"] == "PENDING_USER_VOTE"
+    assert outcome["payload"]["comparison_observations"]["candidate_count"] == len(comparison["results"])
+
+    winner = next(result for result in comparison["results"] if result["candidate_state"] == "READY")
+    assert client.post(
+        f"/api/v1/tuning-rounds/{comparison['round']['id']}/vote",
+        json={"candidate_ids": [winner["candidate"]["id"]]},
+    ).status_code == 200
+    assert client.post(
+        f"/api/v1/rag-instances/{instance_id}/tuning/finalize",
+        json={"document_id": document_id},
+    ).status_code == 200
+    finalized_outcome = client.get(
+        f"/api/v1/rag-instances/{instance_id}/artifacts/{outcome['id']}"
+    ).json()
+    assert finalized_outcome["metadata"]["selection_state"] == "FINALIZED"
+    assert document_id in finalized_outcome["metadata"]["selected_pipelines"]
+    snapshot = main.state_payload()
+    assert {"RETUNING_BASELINE", "RETUNING_OUTCOME"} <= {artifact["type"] for artifact in snapshot["artifacts"]}
+
+
+def test_source_provenance_dedup_and_reparse_retry_preserve_artifact_history(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("RAG_SOURCE_STORAGE_PATH", str(tmp_path / "sources"))
+    instance_id = create_instance()
+    uploaded = client.post(
+        f"/api/v1/rag-instances/{instance_id}/documents",
+        json={
+            "documents": [
+                {"filename": "policy-a.txt", "content": "국내 출장 숙박비는 1박 10만원을 한도로 합니다."},
+                {"filename": "policy-b.txt", "content": "국내 출장 숙박비는 1박 10만원을 한도로 합니다."},
+            ]
+        },
+    )
+    assert uploaded.status_code == 202
+    upload_body = uploaded.json()
+    assert wait_for_job(upload_body["job"]["id"])["state"] == "SUCCEEDED"
+    first_id, second_id = (document["id"] for document in upload_body["documents"])
+    detail = client.get(f"/api/v1/rag-instances/{instance_id}").json()
+    first, second = detail["documents"]
+    assert first["source"]["checksum_sha256"] == second["source"]["checksum_sha256"]
+    assert first["source"]["storage_key"] == second["source"]["storage_key"]
+    assert first["source"]["deduplication"]["status"] == "STORED"
+    assert second["source"]["deduplication"]["status"] == "DEDUPLICATED"
+    assert second["source"]["deduplication"]["deduplicated_from_document_id"] == first_id
+    assert first["provenance"]["parser"]["version"] == main.PARSER_PIPELINE_VERSION
+    assert first["provenance"]["chunking"]["version"] == main.CHUNKING_PIPELINE_VERSION
+    assert first["provenance"]["model"]["version"] == main.MODEL_PROVENANCE_VERSION
+    assert first["provenance"]["model"]["embedding_model"] == "BGE-M3"
+
+    original_start = main.start_processing_job
+    monkeypatch.setattr(main, "start_processing_job", lambda *args, **kwargs: None)
+    reparse = client.post(
+        f"/api/v1/rag-instances/{instance_id}/documents/{first_id}/reparse",
+        json={"reason": "parser release verification"},
+    )
+    assert reparse.status_code == 202
+    reparse_body = reparse.json()
+    assert reparse_body["job"]["kind"] == "REPARSE"
+    baseline = client.get(
+        f"/api/v1/rag-instances/{instance_id}/artifacts/{reparse_body['baseline_artifact']['id']}"
+    ).json()
+    assert baseline["type"] == "REPARSE_BASELINE"
+    assert baseline["payload"]["document"]["source"]["checksum_sha256"] == first["source"]["checksum_sha256"]
+    cancelled = client.post(f"/api/v1/rag-jobs/{reparse_body['job']['id']}/cancel")
+    assert cancelled.status_code == 200
+    # The queue is intentionally paused above; let the existing worker boundary
+    # observe the cancellation before exercising its normal retry endpoint.
+    main.run_processing_job(reparse_body["job"]["id"], main.PipelineMode.RETUNE)
+    assert client.get(f"/api/v1/rag-jobs/{reparse_body['job']['id']}").json()["state"] == "CANCELLED"
+    monkeypatch.setattr(main, "start_processing_job", original_start)
+    retried = client.post(f"/api/v1/rag-jobs/{reparse_body['job']['id']}/retry")
+    assert retried.status_code == 200
+    assert retried.json()["kind"] == "REPARSE"
+    assert wait_for_job(reparse_body["job"]["id"])["state"] == "SUCCEEDED"
+
+    reparsed = client.get(f"/api/v1/rag-instances/{instance_id}").json()["documents"]
+    reparsed_first = next(document for document in reparsed if document["id"] == first_id)
+    assert reparsed_first["source"]["storage_key"] == first["source"]["storage_key"]
+    assert reparsed_first["provenance"]["parser"]["parse_revision"] == 2
+    run_artifact = client.get(
+        f"/api/v1/rag-instances/{instance_id}/artifacts/{reparse_body['artifact']['id']}"
+    ).json()
+    assert run_artifact["type"] == "REPARSE_RUN"
+    assert run_artifact["metadata"]["baseline_artifact_id"] == reparse_body["baseline_artifact"]["id"]
+    assert run_artifact["metadata"]["reparsed_provenance"][first_id]["parser"]["parse_revision"] == 2
+    assert second_id in main.INSTANCES[instance_id].documents
+    monkeypatch.setenv("RAG_SOURCE_STORAGE_BACKEND", "object")
+    monkeypatch.setenv("RAG_OBJECT_STORAGE_ENDPOINT", "https://object-gateway.test")
+    monkeypatch.setenv("RAG_OBJECT_STORAGE_BUCKET", "rag-sources")
+    assert source_storage().backend == "http_object_storage"

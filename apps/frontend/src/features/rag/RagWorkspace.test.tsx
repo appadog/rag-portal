@@ -145,4 +145,58 @@ describe('RagSetupPage candidate readiness', () => {
     expect(screen.getByText(/대표 조각 120\/1200개만 사용했어요/)).toBeInTheDocument();
     expect(screen.getByText(/전체 문서 색인을 이어서 준비합니다/)).toBeInTheDocument();
   });
+
+  it('shows adaptive exploration as a proposal without auto-selecting candidates', async () => {
+    const user = userEvent.setup();
+    const detail = setupDetail();
+    detail.candidateExploration = {
+      id: 'exploration-1',
+      phase: 'NARROWED',
+      poolCount: 8,
+      proposedCandidateIds: ['article-hybrid'],
+      proposedCandidates: [{ id: 'article-hybrid', label: '일반 검색' }],
+      rationales: ['chunking: 긴 문단 경계를 더 보존하는 후보를 우선 비교해요.'],
+      evidenceBoundary: 'FALLBACK',
+      rollback: { canRollback: true, canRestore: false, state: 'AVAILABLE' },
+    };
+    vi.spyOn(ragApi, 'get').mockResolvedValue(detail);
+    vi.spyOn(ragApi, 'latestCandidateExploration').mockResolvedValue(detail.candidateExploration);
+    const rollback = vi.spyOn(ragApi, 'rollbackCandidateExploration').mockResolvedValue(undefined);
+    renderSetup();
+
+    const exploration = await screen.findByRole('region', { name: '적응형 후보 탐색' });
+    expect(exploration).toHaveTextContent('제안 범위를 정리했어요');
+    expect(exploration).toHaveTextContent('후보 풀 8개');
+    expect(exploration).toHaveTextContent('제안 범위 1개');
+    expect(exploration).toHaveTextContent('긴 문단 경계를 더 보존하는 후보를 우선 비교해요.');
+    expect(exploration).toHaveTextContent(
+      '개발용 fallback 또는 불완전 결과는 품질 근거로 사용하지 않아요.',
+    );
+    expect(exploration).toHaveTextContent('자동 선택되지 않아요');
+    expect(screen.getByRole('checkbox', { name: /일반 검색, 비교 가능/ })).not.toBeChecked();
+    expect(screen.getByText('탐색 제안 · 자동 선택 안 함')).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: '제안 후보 되돌리기' }));
+    await waitFor(() => expect(rollback).toHaveBeenCalledWith('exploration-1'));
+    expect(
+      await screen.findByText(/현재 연결에서는 제안 후보 되돌리기를 지원하지 않아요/),
+    ).toBeInTheDocument();
+  });
+
+  it('keeps manual comparison available when adaptive exploration is unavailable', async () => {
+    const user = userEvent.setup();
+    const detail = setupDetail();
+    vi.spyOn(ragApi, 'get').mockResolvedValue(detail);
+    vi.spyOn(ragApi, 'latestCandidateExploration').mockResolvedValue(undefined);
+    vi.spyOn(ragApi, 'startCandidateExploration').mockResolvedValue(undefined);
+    renderSetup();
+
+    const exploration = await screen.findByRole('region', { name: '적응형 후보 탐색' });
+    await user.click(screen.getByRole('button', { name: '후보 탐색 제안 만들기' }));
+    expect(
+      await screen.findByText(/현재 연결에서는 후보 탐색 제안을 준비하지 못했어요/),
+    ).toBeInTheDocument();
+    expect(exploration).toHaveTextContent('제안은 자동 선택이나 확정을 하지 않아요.');
+    expect(screen.getByRole('checkbox', { name: /일반 검색, 비교 가능/ })).not.toBeDisabled();
+  });
 });

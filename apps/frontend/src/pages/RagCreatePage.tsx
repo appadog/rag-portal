@@ -234,6 +234,8 @@ export function RagCreatePage() {
   const [loadingRecommendations, setLoadingRecommendations] = useState(false);
   const [benchmark, setBenchmark] = useState<EmbeddingBenchmark>();
   const [loadingBenchmark, setLoadingBenchmark] = useState(false);
+  const [recommendationError, setRecommendationError] = useState<string>();
+  const [createError, setCreateError] = useState<string>();
   const questionnaire = {
     primaryLanguage: language,
     requiresOnPremise: privateData === 'yes',
@@ -243,6 +245,7 @@ export function RagCreatePage() {
   const showRecommendations = async () => {
     setLoadingRecommendations(true);
     setLoadingBenchmark(true);
+    setRecommendationError(undefined);
     try {
       const [items, latestBenchmark] = await Promise.all([
         ragApi.recommendEmbeddingModels(questionnaire),
@@ -252,6 +255,11 @@ export function RagCreatePage() {
       setBenchmark(latestBenchmark);
       setSelectedModel(items.find((item) => item.recommended)?.id ?? items[0]?.id ?? '');
       setStep(2);
+    } catch (error) {
+      setRecommendationError(
+        (error as Error).message ||
+          '추천과 실측 결과를 불러오지 못했어요. 잠시 뒤 다시 시도해 주세요.',
+      );
     } finally {
       setLoadingRecommendations(false);
       setLoadingBenchmark(false);
@@ -260,6 +268,7 @@ export function RagCreatePage() {
   const create = async () => {
     if (!selectedModel) return;
     setSaving(true);
+    setCreateError(undefined);
     try {
       const item = await ragApi.create({
         name,
@@ -267,6 +276,11 @@ export function RagCreatePage() {
         questionnaire,
       });
       navigate(`/rag/${item.id}/setup`);
+    } catch (error) {
+      setCreateError(
+        (error as Error).message ||
+          '지식 공간을 만들지 못했어요. 입력을 확인한 뒤 다시 시도해 주세요.',
+      );
     } finally {
       setSaving(false);
     }
@@ -356,6 +370,7 @@ export function RagCreatePage() {
               {loadingRecommendations ? '추천을 준비하는 중…' : '후보 비교하기 →'}
             </Button>
           </div>
+          {recommendationError && <p role="alert">{recommendationError}</p>}
         </Card>
       ) : (
         <Card style={{ padding: 28 }}>
@@ -404,6 +419,7 @@ export function RagCreatePage() {
               {saving ? '만드는 중…' : '문서 올리기 →'}
             </Button>
           </div>
+          {createError && <p role="alert">{createError}</p>}
         </Card>
       )}
     </Wrap>

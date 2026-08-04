@@ -1,7 +1,7 @@
 # RAG Portal 기능 명세서
 
 > 대상: 제품·프론트엔드·백엔드·QA 담당자  
-> 기준: Sprint 01–10 구현 상태  
+> 기준: Sprint 01–15 구현·자동 QA 상태
 > 로그인: 이미 완료된 세션을 전제로 하며, 인증·권한 관리는 이 명세 범위 밖이다.
 
 ## 1. 제품 목적
@@ -26,6 +26,8 @@
 4. 사용자는 동일 질문의 후보 답변과 인라인 인용을 비교하고 `READY` 후보에만 투표한다.
 5. 단독 1위 후보를 문서별 파이프라인으로 확정한다. 대형 문서의 샘플 비교는 확정 뒤 전체 재인덱싱한다.
 6. 확정 문서를 하나 이상 선택해 grounded 검색을 수행하고, 인용 원문·관련 artifact·피드백을 확인한다.
+7. 원본 보관이 확인된 문서는 checksum·처리 버전을 확인한 뒤 명시적으로 재파싱할 수 있다. 재파싱은 이전 artifact를 지우지 않는다.
+8. 재튜닝·후보 탐색은 추천과 근거를 보여주지만 자동 실행·자동 확정하지 않는다. 사용자가 시작하고 탐색 변경은 rollback/restore할 수 있다.
 
 ## 3. 기능 상세
 
@@ -80,11 +82,18 @@ job 상태는 `QUEUED`, `PARSING`, `GENERATING_CANDIDATES`, `INDEXING`, `SUCCEED
 - SSE는 `citations` → `token` → `done` 이벤트를 보낸다. 사용자는 스트리밍을 중단할 수 있고, 부분 답변·요청 문서 범위·민감도는 보존된다.
 - 다문서 답변은 문서별 citation 그룹과 문서 커버리지를 표시하며, 원시 점수는 기본 화면에 노출하지 않는다.
 
-### 3.7 artifact·피드백·재튜닝
+### 3.7 artifact·피드백·재튜닝·탐색
 
 - 처리, 비교, 파이프라인 확정, 검색 답변, 재튜닝은 artifact로 저장한다.
 - 답변 피드백에는 rating, comment, artifact/document/citation 문맥을 포함할 수 있다.
 - 누적 부정 피드백은 명시적 재튜닝 추천 신호를 만들며, 재튜닝은 자동 실행하지 않고 사용자가 시작한다.
+- 후보 탐색은 bounded 후보 풀·제안군·파라미터 변경 근거·evidence boundary를 ledger와 artifact로 남긴다. 제안 후보도 자동 투표·선택·확정하지 않는다.
+
+### 3.8 원본 재현성·운영 작업
+
+- 문서 원본은 SHA-256 checksum과 인스턴스 범위 dedup 상태를 가진 immutable source storage adapter에 보관한다. local filesystem이 기본이며 object storage gateway는 환경 설정으로 연결한다.
+- parser revision, chunking analysis/version, embedding model/provider/dimension을 문서 provenance로 저장한다. 재파싱은 원본이 있는 경우에만 허용하며 이전 artifact를 보존한다.
+- job은 dispatch receipt·idempotency key·worker heartbeat·bounded retry/backoff를 저장한다. 실패 한도 초과 작업은 dead-letter가 되며 명시적 recovery로만 재개한다.
 
 ## 4. API 계약 요약
 
@@ -94,30 +103,32 @@ job 상태는 `QUEUED`, `PARSING`, `GENERATING_CANDIDATES`, `INDEXING`, `SUCCEED
 | --- | --- |
 | Runtime/benchmark | `GET /model-runtime`, `GET /large-document-policy`, `POST /embedding-benchmarks/run`, `GET /embedding-benchmarks/latest` |
 | 지식 공간 | `GET/POST /rag-instances`, `POST /rag-instances/embedding-recommendations`, `GET /rag-instances/{id}`, `GET /rag-instances/{id}/execution-plan` |
-| 문서/job | `POST /rag-instances/{id}/documents`, `GET /rag-jobs/{jobId}`, `POST /rag-jobs/{jobId}/cancel`, `POST /rag-jobs/{jobId}/retry` |
+| 문서/job | `POST /rag-instances/{id}/documents`, `POST /rag-instances/{id}/documents/{documentId}/reparse`, `GET /rag-jobs/{jobId}`, `POST /rag-jobs/{jobId}/cancel`, `POST /rag-jobs/{jobId}/retry`, job platform/dead-letter/recovery endpoints |
 | 튜닝 | `POST /rag-instances/{id}/tuning/compare`, `POST /tuning-rounds/{id}/vote`, `POST /rag-instances/{id}/tuning/finalize` |
-| 검색 | `POST /rag-instances/{id}/search`, `GET /rag-instances/{id}/search/stream`, `GET /documents/{documentId}/segments/{segmentId}` |
-| 운영 기능 | artifacts, feedback, retune, document delete endpoint는 OpenAPI와 backend README를 따른다. |
+| 검색 | `GET /rag-instances/{id}/search/preflight`, `POST /rag-instances/{id}/search`, `GET /rag-instances/{id}/search/stream`, `GET /documents/{documentId}/segments/{segmentId}` |
+| 운영 기능 | artifacts, feedback, retune recommendation, candidate exploration/rollback/restore, document delete endpoint는 OpenAPI와 backend README를 따른다. |
 
 프론트 API adapter는 wire payload를 `apps/frontend/src/shared/api/client.ts`에서 타입으로 변환한다. API를 변경할 때 backend 응답, frontend adapter/types, mock fixture, backend pytest, frontend Vitest를 함께 갱신한다.
 
 ## 5. 영속성·runtime 경계
 
-- 인스턴스·문서·후보·job·비교 라운드·artifact·feedback·benchmark run은 SQLite snapshot에 저장한다.
-- 현재 SQLite/thread worker는 로컬 개발용이다. object storage, 운영 DB, Redis/SQS worker, dead-letter는 Sprint 13–14 범위다.
+- 인스턴스·문서·후보·job·비교 라운드·artifact·feedback·benchmark run·exploration ledger는 SQLite snapshot에 저장한다.
+- source storage와 Redis/SQS-compatible job adapter, dead-letter/recovery 계약은 구현됐다. local filesystem/thread fallback이 기본이므로 실제 object storage·broker·multi-worker smoke는 운영 release gate다.
 - 임베딩·reranker·generator·OCR endpoint는 개발 서버에 구축되어 있다는 계약으로 호출한다. endpoint가 없거나 실패하면 provider/warning/fallback metadata를 반환한다.
 - 실제 모델 없이 로컬 CI를 통과하는 것은 release gate 통과가 아니다. 실제 모델·실제 파일 E2E는 Sprint 11에서 수행한다.
 
 ## 6. 작업 인계 규칙
 
-1. 다음 작업은 [`RAG_PORTAL_FEATURE_PLAN.md`](../RAG_PORTAL_FEATURE_PLAN.md)의 Sprint 11부터 진행한다.
+1. 다음 작업은 [`RAG_PORTAL_FEATURE_PLAN.md`](../RAG_PORTAL_FEATURE_PLAN.md)의 실제 runtime·운영 release gate부터 진행한다.
 2. 각 Sprint는 `docs/SPRINT_XX_*.md`에 목적, API/상태 계약, 검증 결과, 외부 runtime 가정을 기록한다.
 3. UI 변경은 NotebookLM-inspired design 문서와 접근성·반응형 회귀를 함께 검토한다.
 4. 실제 모델 smoke 결과는 fallback 성공과 구분해 provider·실행 시각·corpus 버전을 남긴다.
+5. `VITE_API_BASE_URL`이 설정된 실행에서는 API 오류를 mock fallback으로 숨기지 않는다. mock은 API base가 없는 프런트 단독 개발에서만 사용한다.
 
 ## 7. 참고 문서
 
 - [개발 백로그와 스프린트 순서](../RAG_PORTAL_FEATURE_PLAN.md)
 - [모델 runtime 구축 기준](./MODEL_RUNTIME_DEPLOYMENT.md)
 - [백엔드 API 계약](../apps/backend/README.md)
-- [Sprint 06–10 구현 기록](./SPRINT_06_CANDIDATE_READINESS.md), [Sprint 10 다문서 검색 기록](./SPRINT_10_MULTI_DOCUMENT_SEARCH.md)
+- [Sprint 12 재튜닝](./SPRINT_12_FEEDBACK_RETUNING.md), [Sprint 13 재현성](./SPRINT_13_SOURCE_REPRODUCIBILITY.md), [Sprint 14 운영 job](./SPRINT_14_OPERATIONAL_JOBS.md), [Sprint 15 후보 탐색](./SPRINT_15_ADAPTIVE_EXPLORATION.md)
+- [Sprint 07–15 backend QA](./SPRINT_07_15_BACKEND_QA.md), [frontend QA](./design/SPRINT_07_15_FRONTEND_QA.md), [UX QA](./design/SPRINT_07_15_UX_QA.md)

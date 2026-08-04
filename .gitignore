@@ -89,9 +89,11 @@ apps/backend/*.egg-info/
 htmlcov/
 
 # Backend local runtime files
+.rag-sources/
 apps/backend/.local/
 apps/backend/uploads/
 apps/backend/storage/
+apps/backend/.rag-sources/
 apps/backend/tmp/
 apps/backend/celerybeat-schedule*
 
