@@ -1,4 +1,4 @@
-import type { ReactNode } from 'react';
+import { useId, useState, type ReactNode } from 'react';
 import styled, { css } from 'styled-components';
 import { theme } from '../styles/theme';
 import type { RagStatus } from '../api/types';
@@ -157,6 +157,99 @@ export const Pill = styled.span<{ $tone?: 'brand' | 'muted' | 'warning' }>`
       color: ${theme.colors.muted};
     `}
 `;
+
+const HelpWrap = styled.span`
+  position: relative;
+  display: inline-flex;
+  vertical-align: middle;
+`;
+
+const HelpTrigger = styled.button`
+  display: grid;
+  width: 1.25rem;
+  height: 1.25rem;
+  place-items: center;
+  padding: 0;
+  border: 1px solid var(--rp-border);
+  border-radius: 50%;
+  color: var(--rp-ink-muted);
+  background: var(--rp-surface);
+  cursor: help;
+  font-size: 0.75rem;
+  font-weight: 800;
+  line-height: 1;
+  &:hover {
+    border-color: var(--rp-action);
+    color: var(--rp-action);
+  }
+  &:focus-visible {
+    outline: none;
+    box-shadow: var(--rp-focus-ring);
+  }
+`;
+
+const HelpContent = styled.span<{ $open: boolean }>`
+  position: absolute;
+  z-index: 20;
+  top: calc(100% + var(--rp-space-2));
+  left: 50%;
+  display: ${({ $open }) => ($open ? 'block' : 'none')};
+  width: min(19rem, calc(100vw - var(--rp-space-8)));
+  transform: translateX(-50%);
+  padding: var(--rp-space-3);
+  border: 1px solid var(--rp-border-focus);
+  border-radius: var(--rp-radius-sm);
+  background: var(--rp-ink);
+  color: var(--rp-surface);
+  box-shadow: var(--rp-shadow-raised);
+  font-size: var(--rp-font-size-12);
+  font-weight: 500;
+  line-height: var(--rp-line-normal);
+  text-align: left;
+
+  strong,
+  span {
+    display: block;
+  }
+  strong {
+    margin-bottom: var(--rp-space-1);
+    font-size: var(--rp-font-size-12);
+  }
+`;
+
+/**
+ * Keeps a plain-language label uncluttered while making its technical name and
+ * decision rule available to mouse, touch, and keyboard users.
+ */
+export function HelpTip({
+  label,
+  term,
+  children,
+}: {
+  label: string;
+  term: string;
+  children: ReactNode;
+}) {
+  const [open, setOpen] = useState(false);
+  const contentId = useId();
+  return (
+    <HelpWrap>
+      <HelpTrigger
+        type="button"
+        aria-label={`${label} 기술 설명`}
+        aria-expanded={open}
+        aria-controls={contentId}
+        onClick={() => setOpen((current) => !current)}
+      >
+        ?
+      </HelpTrigger>
+      <HelpContent $open={open} id={contentId} role="note">
+        <strong>{term}</strong>
+        <span>{children}</span>
+      </HelpContent>
+    </HelpWrap>
+  );
+}
 
 export function LoadingState({ label = '불러오는 중이에요…' }: { label?: string }) {
   return (

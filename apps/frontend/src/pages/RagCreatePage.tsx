@@ -3,7 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import styled from 'styled-components';
 import { ragApi } from '../shared/api/client';
 import type { EmbeddingBenchmark, EmbeddingModelRecommendation } from '../shared/api/types';
-import { Button, Card, Input, Pill } from '../shared/ui/primitives';
+import { Button, Card, HelpTip, Input, Pill } from '../shared/ui/primitives';
 import { theme } from '../shared/styles/theme';
 
 const Wrap = styled.div`
@@ -68,13 +68,13 @@ const Choice = styled.label<{ $selected: boolean }>`
     font-size: 15px;
     margin-bottom: 5px;
   }
-  span {
+  > span {
     font-size: 13px;
     color: ${theme.colors.muted};
     line-height: 1.5;
   }
 `;
-const Field = styled.label`
+const Field = styled.div`
   display: block;
   font-weight: 700;
   font-size: 14px;
@@ -170,6 +170,14 @@ const BenchmarkPanel = styled.section`
     color: var(--rp-ink-muted);
     font-size: var(--rp-font-size-12);
   }
+  .metric-help {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--rp-space-2);
+    margin-top: var(--rp-space-3);
+    color: var(--rp-ink-muted);
+    font-size: var(--rp-font-size-12);
+  }
 `;
 
 function percent(value: number | null) {
@@ -186,7 +194,13 @@ function BenchmarkSummary({
 }) {
   return (
     <BenchmarkPanel aria-live="polite" aria-busy={loading}>
-      <h3>우리 문서 실측 결과</h3>
+      <h3>
+        우리 문서 실측 결과{' '}
+        <HelpTip label="우리 문서 실측 결과" term="Embedding retrieval benchmark">
+          같은 문서·질문 세트에서 임베딩 모델별로 문서 근거를 얼마나 잘 찾는지 측정한 결과예요. 공개
+          리더보드 점수와는 다른, 이 지식 공간용 실측값입니다.
+        </HelpTip>
+      </h3>
       {loading ? (
         <p className="empty">실측 결과를 확인하고 있어요.</p>
       ) : !benchmark ? (
@@ -214,6 +228,29 @@ function BenchmarkSummary({
                 </span>
               </div>
             ))}
+          </div>
+          <div className="metric-help" aria-label="실측 지표 설명">
+            <span>
+              Recall@k{' '}
+              <HelpTip label="Recall@k" term="Recall at k">
+                정답 근거가 상위 k개 검색 결과 안에 들어온 비율이에요. 높을수록 근거를 놓치지
+                않아요.
+              </HelpTip>
+            </span>
+            <span>
+              MRR{' '}
+              <HelpTip label="MRR" term="Mean Reciprocal Rank">
+                정답 근거가 앞쪽에 나오는 정도를 평균 낸 값이에요. 높을수록 첫 결과에서 빨리 찾을
+                가능성이 커요.
+              </HelpTip>
+            </span>
+            <span>
+              차원{' '}
+              <HelpTip label="임베딩 차원" term="Embedding dimension">
+                문서 의미를 숫자 벡터로 표현할 때 사용하는 길이예요. 이 값이 다른 모델의 벡터는 같은
+                검색 공간에 섞을 수 없어요.
+              </HelpTip>
+            </span>
           </div>
         </>
       )}
@@ -309,7 +346,10 @@ export function RagCreatePage() {
         <Card style={{ padding: 28 }}>
           <h2 style={{ marginTop: 0 }}>어떤 문서를 다루나요?</h2>
           <Field>
-            주로 어떤 언어로 작성되어 있나요?
+            주로 어떤 언어로 작성되어 있나요?{' '}
+            <HelpTip label="문서 언어" term="Multilingual embedding">
+              문장을 의미 벡터로 바꾸는 임베딩 모델의 언어 처리 범위를 고르는 질문이에요.
+            </HelpTip>
             <span>언어에 맞는 임베딩 모델을 추천하는 데 사용합니다.</span>
           </Field>
           <Choices>
@@ -329,7 +369,10 @@ export function RagCreatePage() {
             ))}
           </Choices>
           <Field>
-            문서를 외부 서비스로 보낼 수 없나요?
+            문서를 외부 서비스로 보낼 수 없나요?{' '}
+            <HelpTip label="외부 서비스 전송" term="On-premise / data residency">
+              문서 데이터를 조직 내부 또는 지정한 인프라 안에서만 처리해야 하는지를 뜻해요.
+            </HelpTip>
             <span>예를 선택하면 자체 운영에 적합한 모델을 우선합니다.</span>
           </Field>
           <Choices>
@@ -348,7 +391,13 @@ export function RagCreatePage() {
               </Choice>
             ))}
           </Choices>
-          <Field>여러 인물·조직·사건의 관계를 함께 묻는 일이 많나요?</Field>
+          <Field>
+            여러 인물·조직·사건의 관계를 함께 묻는 일이 많나요?{' '}
+            <HelpTip label="연결형 질문" term="Multi-hop retrieval / GraphRAG">
+              한 조각의 문장만 찾는 대신 여러 문서의 관계를 따라가며 답해야 하는 질문을 말해요.
+              필요할 때만 연결형 검색 후보를 권장합니다.
+            </HelpTip>
+          </Field>
           <Choices>
             {[
               ['no', '아니요', '규정, 매뉴얼처럼 사실을 빠르게 찾는 일이 주로 있어요.'],
@@ -379,7 +428,11 @@ export function RagCreatePage() {
           <p style={{ color: theme.colors.muted, lineHeight: 1.6 }}>
             추천은 출발점일 뿐이에요. 선택은 이 지식 공간의 설정으로 저장되고, 실제 임베딩 연결
             뒤에는 모든 문서가 같은 임베딩 공간을 사용합니다. 현재 로컬 미리보기 검색은 비교
-            기준선인 lexical 방식으로 동작합니다.
+            기준선인 lexical 방식으로 동작합니다.{' '}
+            <HelpTip label="임베딩 모델 선택" term="Shared embedding space">
+              모든 문서가 같은 의미 벡터 공간을 사용해야 함께 검색할 수 있어요. 그래서 이 단계에서
+              하나의 모델을 지식 공간 전체에 고정합니다.
+            </HelpTip>
           </p>
           <BenchmarkSummary benchmark={benchmark} loading={loadingBenchmark} />
           <ModelChoices role="radiogroup" aria-label="임베딩 모델 후보">

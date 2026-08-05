@@ -15,6 +15,7 @@ import {
   Button,
   Card,
   ErrorState,
+  HelpTip,
   Input,
   LoadingState,
   Pill,
@@ -1501,7 +1502,11 @@ export function RagDetailPage() {
                 ))}
               </div>
               <p className="sensitivity-help" id="sensitivity-help">
-                {sensitivityDescriptions[sensitivity]}
+                {sensitivityDescriptions[sensitivity]}{' '}
+                <HelpTip label="검색 민감도" term="Retrieval relevance threshold">
+                  검색 결과를 얼마나 넓게 포함할지 정하는 관련성 기준이에요. 문서 내용 자체를
+                  바꾸거나 모델을 다시 학습시키지는 않아요.
+                </HelpTip>
               </p>
               <div className="composer-row">
                 <Input
@@ -1711,7 +1716,13 @@ export function RagDetailPage() {
                     const ready = Boolean(executionPlan?.ready) && unavailable.length === 0;
                     return (
                       <div className="release-gate" role="status" aria-label="배포 전 런타임 점검">
-                        <strong>개발자 점검 · 런타임 {ready ? '준비됨' : '확인 필요'}</strong>
+                        <strong>
+                          개발자 점검 · 런타임 {ready ? '준비됨' : '확인 필요'}{' '}
+                          <HelpTip label="모델 런타임" term="Model serving runtime">
+                            임베딩·재정렬·생성·OCR 모델을 호출하는 서버의 연결 상태예요. 준비되지
+                            않았을 때는 개발용 fallback 결과가 사용될 수 있습니다.
+                          </HelpTip>
+                        </strong>
                         <span>
                           {ready
                             ? `필수 서비스 ${requiredServices.length}개가 준비되었습니다.`
@@ -1841,15 +1852,33 @@ export function RagDetailPage() {
                   )}
                   <dl className="spec">
                     <div>
-                      <dt>임베딩 모델</dt>
+                      <dt>
+                        임베딩 모델{' '}
+                        <HelpTip label="임베딩 모델" term="Embedding model">
+                          문서와 질문을 의미를 담은 숫자 벡터로 바꾸는 모델이에요. 같은 지식 공간의
+                          문서는 같은 모델을 사용해야 함께 비교·검색할 수 있어요.
+                        </HelpTip>
+                      </dt>
                       <dd>{detail.embeddingModel}</dd>
                     </div>
                     <div>
-                      <dt>연결형 질문</dt>
+                      <dt>
+                        연결형 질문{' '}
+                        <HelpTip label="연결형 질문" term="GraphRAG / multi-hop retrieval">
+                          여러 문서나 개체 사이의 관계를 따라가야 답할 수 있는 질문에 사용하는 검색
+                          보조 방식이에요.
+                        </HelpTip>
+                      </dt>
                       <dd>{detail.graphragEnabled ? '사용' : '사용 안 함'}</dd>
                     </div>
                     <div>
-                      <dt>검색 방식</dt>
+                      <dt>
+                        검색 방식{' '}
+                        <HelpTip label="검색 방식" term="Retrieval configuration">
+                          문서 조각을 찾는 조합이에요. BM25 키워드 검색, dense 의미 검색, hybrid,
+                          reranking 등이 문서별로 확정될 수 있어요.
+                        </HelpTip>
+                      </dt>
                       <dd>
                         {new Set(readyDocuments.map((document) => document.pipelineLabel)).size > 1
                           ? '일반 검색 (문서별 방식이 다름)'
@@ -1857,7 +1886,13 @@ export function RagDetailPage() {
                       </dd>
                     </div>
                     <div>
-                      <dt>실행 상태</dt>
+                      <dt>
+                        실행 상태{' '}
+                        <HelpTip label="실행 상태" term="Provider readiness / fallback policy">
+                          실제 모델 서버를 썼는지, 연결되지 않아 개발용 기준선으로 처리했는지를
+                          알려주는 상태예요.
+                        </HelpTip>
+                      </dt>
                       <dd>
                         {executionPlan?.ready
                           ? '연결된 모델 서비스 사용'
@@ -1894,15 +1929,33 @@ export function RagDetailPage() {
                         aria-label={`${document.name} 출처 및 처리 정보`}
                       >
                         <div>
-                          <dt>원본 checksum</dt>
+                          <dt>
+                            원본 checksum{' '}
+                            <HelpTip label="원본 checksum" term="SHA-256 checksum">
+                              원본 파일 내용으로 계산한 고유 지문이에요. 같은 파일인지 확인하고 중복
+                              저장을 피하는 데 사용합니다.
+                            </HelpTip>
+                          </dt>
                           <dd>{checksumCopy(document.provenance?.checksum)}</dd>
                         </div>
                         <div>
-                          <dt>중복 처리</dt>
+                          <dt>
+                            중복 처리{' '}
+                            <HelpTip label="중복 처리" term="Content-addressed deduplication">
+                              checksum이 같은 원본은 저장 객체를 재사용하되, 각 문서의 처리 이력은
+                              따로 보존하는 방식이에요.
+                            </HelpTip>
+                          </dt>
                           <dd>{deduplicationCopy(document.provenance?.deduplication)}</dd>
                         </div>
                         <div>
-                          <dt>파서</dt>
+                          <dt>
+                            파서{' '}
+                            <HelpTip label="파서" term="Document parser / OCR pipeline">
+                              PDF·DOCX·XLSX 등의 원본에서 텍스트와 구조를 추출한 도구와 버전이에요.
+                              스캔 문서는 OCR이 준비된 경우 글자를 읽어 냅니다.
+                            </HelpTip>
+                          </dt>
                           <dd>
                             {document.provenance?.parser
                               ? `${document.provenance.parser}${document.provenance.parserVersion ? ` · ${document.provenance.parserVersion}` : ''}`
@@ -1910,7 +1963,13 @@ export function RagDetailPage() {
                           </dd>
                         </div>
                         <div>
-                          <dt>청킹 · 임베딩</dt>
+                          <dt>
+                            청킹 · 임베딩{' '}
+                            <HelpTip label="청킹과 임베딩" term="Chunking + vector indexing">
+                              문서를 검색 가능한 조각으로 나누는 과정과, 각 조각을 의미 벡터로
+                              색인하는 과정이에요. 검색 품질과 비용에 함께 영향을 줍니다.
+                            </HelpTip>
+                          </dt>
                           <dd>
                             {document.provenance?.chunking ?? '확인할 수 없음'} ·{' '}
                             {document.provenance?.embeddingModel ?? '확인할 수 없음'}
@@ -1920,7 +1979,13 @@ export function RagDetailPage() {
                           </dd>
                         </div>
                         <div>
-                          <dt>원본 보관</dt>
+                          <dt>
+                            원본 보관{' '}
+                            <HelpTip label="원본 보관" term="Immutable source storage">
+                              재현을 위해 업로드 당시의 원본을 변경하지 않고 보관하는지 알려줘요.
+                              보관된 원본만 다시 읽을 수 있어요.
+                            </HelpTip>
+                          </dt>
                           <dd>
                             {document.provenance?.originalAvailable === true
                               ? '원본을 다시 읽을 수 있음'
@@ -1930,7 +1995,13 @@ export function RagDetailPage() {
                           </dd>
                         </div>
                         <div>
-                          <dt>재파싱 상태</dt>
+                          <dt>
+                            재파싱 상태{' '}
+                            <HelpTip label="재파싱 상태" term="Reparse job">
+                              보관한 원본을 현재 파서·청킹 설정으로 다시 읽고 후보를 준비하는 비동기
+                              작업의 상태예요.
+                            </HelpTip>
+                          </dt>
                           <dd>{reparseStateCopy(document.provenance?.reparse?.state)}</dd>
                         </div>
                       </dl>

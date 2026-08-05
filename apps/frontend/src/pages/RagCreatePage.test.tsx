@@ -66,7 +66,7 @@ describe('RagCreatePage', () => {
     );
 
     await user.click(screen.getByRole('button', { name: '후보 비교하기 →' }));
-    expect(await screen.findByRole('heading', { name: '우리 문서 실측 결과' })).toBeInTheDocument();
+    expect(await screen.findByRole('heading', { name: /우리 문서 실측 결과/ })).toBeInTheDocument();
     expect(screen.getByText(/인사 규정 문서 · 질문 24개/)).toBeInTheDocument();
     expect(screen.getByText(/Recall@1 75.0% · Recall@5 92.0%/)).toBeInTheDocument();
     expect(screen.getByText(/MRR 81.0% · 평균 42ms/)).toBeInTheDocument();
@@ -88,5 +88,21 @@ describe('RagCreatePage', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent('추천 서비스를 사용할 수 없어요.');
     expect(screen.getByRole('button', { name: '후보 비교하기 →' })).toBeEnabled();
     expect(screen.getByText('어떤 문서를 다루나요?')).toBeInTheDocument();
+  });
+
+  it('opens a plain-language technical explanation from a question-mark label', async () => {
+    const user = userEvent.setup();
+    render(
+      <MemoryRouter>
+        <RagCreatePage />
+      </MemoryRouter>,
+    );
+
+    const help = screen.getByRole('button', { name: '문서 언어 기술 설명' });
+    expect(help).toHaveAttribute('aria-expanded', 'false');
+    await user.click(help);
+    expect(help).toHaveAttribute('aria-expanded', 'true');
+    expect(screen.getByText('Multilingual embedding')).toBeVisible();
+    expect(screen.getByText(/임베딩 모델의 언어 처리 범위/)).toBeVisible();
   });
 });

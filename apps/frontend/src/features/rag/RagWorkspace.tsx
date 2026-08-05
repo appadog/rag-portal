@@ -18,6 +18,7 @@ import {
   Button,
   Card,
   ErrorState,
+  HelpTip,
   Input,
   LoadingState,
   Pill,
@@ -583,13 +584,9 @@ function Candidate({
         <div>
           <h3>
             {candidate.label}{' '}
-            <button
-              className="help"
-              title={candidate.description}
-              aria-label={`${candidate.label} 설명`}
-            >
-              ?
-            </button>
+            <HelpTip label={`${candidate.label} 후보`} term="RAG pipeline candidate">
+              {candidate.description} 이 후보는 청킹 방식과 검색 방식을 묶은 비교 단위예요.
+            </HelpTip>
           </h3>
           <span className="meta">
             선택 {candidate.selectionCount}회
@@ -1105,7 +1102,11 @@ export function RagSetupPage() {
       </PageHeader>
       {detail.documents.some((document) => document.comparisonScope === 'SAMPLE') && (
         <ComparisonScopeNotice role="status" aria-label="표본 문서 비교 안내">
-          <Pill $tone="warning">표본으로 비교 중</Pill>
+          <Pill $tone="warning">표본으로 비교 중</Pill>{' '}
+          <HelpTip label="표본 비교" term="Sampled indexing">
+            큰 문서는 비용과 시간을 줄이기 위해 대표 조각만 먼저 비교합니다. 확정한 뒤에만 전체
+            청크를 다시 색인합니다.
+          </HelpTip>
           <div>
             <strong>
               {detail.documents
@@ -1130,7 +1131,13 @@ export function RagSetupPage() {
       )}
       {!detail.candidateExploration && (
         <ExplorationNotice aria-label="적응형 후보 탐색" role="region">
-          <h2>후보 탐색</h2>
+          <h2>
+            후보 탐색{' '}
+            <HelpTip label="후보 탐색" term="Adaptive candidate exploration">
+              현재 후보를 자동으로 바꾸지 않고, 청킹·검색 파라미터를 조금 바꾼 비교 후보를 제한된
+              수만 제안하는 과정이에요.
+            </HelpTip>
+          </h2>
           <p>
             현재 후보를 바꾸지 않고, 비교할 변형 후보를 제안받을 수 있어요. 제안은 자동 선택이나
             확정을 하지 않아요.
@@ -1156,7 +1163,13 @@ export function RagSetupPage() {
               제안 범위 {detail.candidateExploration.proposedCandidateIds.length}개
             </Pill>
           </div>
-          <h2>후보 탐색 제안</h2>
+          <h2>
+            후보 탐색 제안{' '}
+            <HelpTip label="후보 탐색 제안" term="Versioned exploration ledger">
+              제안한 후보와 근거, 되돌림 지점을 기록합니다. 선택·투표·확정은 사용자가 직접
+              수행합니다.
+            </HelpTip>
+          </h2>
           {detail.candidateExploration.rationales.length ? (
             <ul aria-label="파라미터 변경 근거">
               {detail.candidateExploration.rationales.map((rationale, index) => (
@@ -1532,8 +1545,12 @@ function LegacyRagDetailPage() {
                 {differentPipelines && (
                   <div className="sens">
                     <span>
-                      검색 방식 <button className="selected">일반 검색</button>
-                      <button title="하이브리드+재순위화">정밀 검색 ?</button>
+                      검색 방식 <button className="selected">일반 검색</button>{' '}
+                      <HelpTip label="정밀 검색" term="Hybrid retrieval + reranking">
+                        키워드 검색(BM25)과 의미 검색(dense retrieval)을 함께 쓰고, 상위 결과를
+                        reranker로 다시 정렬하는 방식이에요. 보통 더 정밀하지만 시간이 더 걸릴 수
+                        있어요.
+                      </HelpTip>
                     </span>
                   </div>
                 )}
